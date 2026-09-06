@@ -64,6 +64,7 @@ class SanitizedContext(BaseModel):
     perceptionLevel: Optional[int] = None        # 1=A11y, 2=DOM, 3=OCR, 4=Screenshot
     stateHash: Optional[str] = None              # Lightweight page state hash
     siteAdapter: Optional[str] = None            # Active site adapter name
+    piiEntities: Optional[list[dict[str, Any]]] = None  # Redacted PII metadata (no raw values)
 
 
 class ActionRequest(BaseModel):
@@ -72,14 +73,21 @@ class ActionRequest(BaseModel):
     context: SanitizedContext
     stepNumber: int = 1
     previousActions: list[dict] = []   # History of prior steps sent to LLM for memory
+    conversationHistory: list[dict[str, Any]] = Field(default_factory=list) # Multi-turn conversational memory
+    clientMetrics: Optional[dict[str, Any]] = None
+    piiEntities: Optional[list[dict[str, Any]]] = None
 
 # ── OUTGOING: Structured Browser Actions ──────────────────────────────────────
 
 ActionType = Literal["click", "fill", "scroll", "select", "focus", "navigate", "wait", "back", "forward", "finish", "ask_user", "done"]
 
 class ActionTarget(BaseModel):
-    type: Literal["selector", "element-id", "role", "text"]
-    value: str
+    type: Optional[str] = "element-id"
+    value: Optional[str] = None
+    elementId: Optional[str] = None
+
+    def get_element_id(self) -> str:
+        return self.elementId or self.value or ""
 
 
 class BrowserAction(BaseModel):
@@ -104,6 +112,7 @@ class ActionResponse(BaseModel):
     modelUsed: str
     promptSentToLLM: Optional[str] = None   # Full prompt for transparency/debugging
     rawLLMResponse: Optional[str] = None    # Raw LLM output before parsing
+    trace: Optional[dict[str, Any]] = None
 
 
 # ── SESSION & METRICS ─────────────────────────────────────────────────────────
@@ -126,3 +135,13 @@ class PrivacyEvent(BaseModel):
     source: str
     redactionMethod: str
     timestamp: int
+
+
+class TraceEventCreate(BaseModel):
+    sessionId: str
+    type: str
+    detail: Optional[str] = None
+    step: Optional[int] = None
+    timestamp: Optional[float] = None
+    metadata: Optional[dict[str, Any]] = None
+

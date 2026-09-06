@@ -158,6 +158,7 @@ function highlightInteraction(el: HTMLElement, type: string) {
 /** Execute a validated browser action */
 export async function executeAction(action: BrowserAction): Promise<ActionResult> {
   const startTime = Date.now();
+  let isFileUpload = false;
 
   try {
     switch (action.action) {
@@ -168,10 +169,56 @@ export async function executeAction(action: BrowserAction): Promise<ActionResult
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
         highlightInteraction(el, 'click');
         await delay(300);
-        // Dispatch full event sequence for maximum compatibility (React, Vue, etc.)
-        el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
-        el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
-        el.click();
+
+        // Check if element triggers native file explorer / picker
+        const isFileUploadTrigger =
+          (el.tagName === 'INPUT' && (el as HTMLInputElement).type === 'file') ||
+          el.id === 'pickfiles' ||
+          el.classList.contains('uploader__btn') ||
+          /file|upload|choose|browse/i.test(el.textContent || '') ||
+          /file|upload|choose|browse/i.test(el.getAttribute('aria-label') || '');
+
+        if (isFileUploadTrigger) {
+          isFileUpload = true;
+          try {
+            el.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+            el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+            el.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
+            el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+            el.click();
+          } catch (clickErr) {
+            console.warn('[ActionValidator] Primary trigger click warning:', clickErr);
+          }
+
+          // Also trigger all file inputs on the page (Plupload, dropzone, uploader container, moxie-shim)
+          const fileInputs = Array.from(
+            document.querySelectorAll<HTMLInputElement>(
+              'input[type="file"], .moxie-shim input, [id^="html5_"], #uploader input[type="file"]'
+            )
+          );
+
+          for (const fi of fileInputs) {
+            try {
+              fi.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+              fi.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+              fi.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
+              fi.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+              fi.click();
+            } catch (fiErr) {
+              console.warn('[ActionValidator] File input click fallback warning:', fiErr);
+            }
+          }
+
+          // Show on-page interactive user-activation toast in case browser security requires direct tab gesture
+          showFileSelectionNotification(el, fileInputs);
+        } else {
+          // Dispatch full event sequence for standard interactive elements
+          el.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+          el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+          el.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
+          el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+          el.click();
+        }
         break;
       }
 
@@ -261,12 +308,99 @@ export async function executeAction(action: BrowserAction): Promise<ActionResult
       }
     }
 
-    return { success: true, action, executedAt: Date.now(), latencyMs: Date.now() - startTime };
+    return {
+      success: true,
+      action,
+      executedAt: Date.now(),
+      latencyMs: Date.now() - startTime,
+      isFileUploadTrigger: isFileUpload,
+    };
   } catch (err) {
-    return { success: false, action, error: String(err), executedAt: Date.now(), latencyMs: Date.now() - startTime };
+    return {
+      success: false,
+      action,
+      error: String(err),
+      executedAt: Date.now(),
+      latencyMs: Date.now() - startTime,
+      isFileUploadTrigger: isFileUpload,
+    };
   }
 }
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** Show an on-page interactive user-activation prompt so File Explorer reliably opens */
+function showFileSelectionNotification(triggerEl: HTMLElement, fileInputs: HTMLInputElement[]): void {
+  try {
+    const existing = document.getElementById('__privsight_file_toast__');
+    if (existing) existing.remove();
+
+    const toast = document.createElement('div');
+    toast.id = '__privsight_file_toast__';
+    toast.style.cssText = `
+      position: fixed;
+      top: 20px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #091322;
+      border: 2px solid #06b6d4;
+      box-shadow: 0 12px 36px rgba(0, 0, 0, 0.75), 0 0 24px rgba(6, 182, 212, 0.5);
+      border-radius: 12px;
+      padding: 12px 20px;
+      z-index: 2147483647;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      color: #f1f5f9;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      cursor: pointer;
+    `;
+
+    toast.innerHTML = `
+      <div style="font-size: 24px; line-height: 1;">📁</div>
+      <div style="text-align: left;">
+        <div style="font-weight: 700; font-size: 13px; color: #38bdf8;">Select files from file explorer</div>
+        <div style="font-size: 11px; color: #94a3b8; margin-top: 1px;">
+          PrivSight triggered file selection. Choose your PDF files to proceed.
+        </div>
+      </div>
+      <button id="__privsight_btn_open__" style="
+        background: linear-gradient(135deg, #0284c7 0%, #0369a1 100%);
+        color: white;
+        border: 1px solid #38bdf8;
+        border-radius: 6px;
+        padding: 6px 14px;
+        font-size: 12px;
+        font-weight: 700;
+        cursor: pointer;
+        white-space: nowrap;
+      ">
+        📂 Choose Files
+      </button>
+    `;
+
+    document.body.appendChild(toast);
+
+    const triggerAllInputs = (e: MouseEvent) => {
+      e.stopPropagation();
+      e.preventDefault();
+      for (const fi of fileInputs) {
+        try { fi.click(); } catch {}
+      }
+      try { triggerEl.click(); } catch {}
+      setTimeout(() => toast.remove(), 1000);
+    };
+
+    toast.addEventListener('click', triggerAllInputs);
+    const btn = toast.querySelector('#__privsight_btn_open__');
+    if (btn) btn.addEventListener('click', triggerAllInputs as any);
+
+    setTimeout(() => {
+      if (toast.parentElement) toast.remove();
+    }, 14000);
+  } catch (err) {
+    console.warn('[ActionValidator] Failed to show file selection notification:', err);
+  }
 }

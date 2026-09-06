@@ -266,8 +266,7 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
 export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
   const entities: PIIEntity[] = [];
   const enabledTypes = new Set(settings.enabledCategories);
-
-  const NAME_LABEL_REGEX = /(?:First\s*name|Given\s*name|Last\s*name|Surname|Full\s*name|User\s*name|Profile\s*name|Passenger|Registered)\s*[:\-]?\s*([A-Za-z\u00C0-\u024F]{2,30})/i;
+  const NAME_LABEL_REGEX = /(?:First\s*name|Given\s*name|Last\s*name|Surname|Full\s*name|User\s*name|Profile\s*name|Passenger|Registered|Hi|Hello|Welcome|Hey|Dear)\s*[,:\-]?\s*([A-Za-z\u00C0-\u024F]{2,30}(?:\s+[A-Za-z\u00C0-\u024F]{2,30})*)/i;
 
   try {
     const walker = document.createTreeWalker(
@@ -385,7 +384,7 @@ export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
 
     // 3. Scan profile name containers and labels (e.g. "First name: Dharaya", "Registered Dharaya")
     if (enabledTypes.has('name')) {
-      const NAME_CONTAINER_REGEX = /(?:First\s*name|Given\s*name|Full\s*name|Registered)\s*[:\-]?\s*([A-Za-z\u00C0-\u024F]{2,30})/i;
+      const NAME_CONTAINER_REGEX = /(?:First\s*name|Given\s*name|Full\s*name|Registered|Hi|Hello|Welcome|Hey|Dear|Account|User)\s*[,:\-]?\s*([A-Za-z\u00C0-\u024F]{2,30}(?:\s+[A-Za-z\u00C0-\u024F]{2,30})*)/i;
       const FORBIDDEN_WORDS = /\b(country|india|united\s*states|timezone|utc|email|phone|password|address|city|state|zip|postal|change|edit|update|delete|cancel|save|profile|account|select|choose|none|optional|required|sign|login|logout|menu|tools)\b/i;
 
       const candidateElements = document.querySelectorAll<HTMLElement>('label, div, p, span, h1, h2, h3, h4, h5, h6, dt, dd, li');

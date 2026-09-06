@@ -14,6 +14,7 @@ module.exports = (env, argv) => {
     output: {
       path: path.resolve(__dirname, 'dist'),
       filename: '[name].js',
+      publicPath: '',
       clean: true,
     },
     resolve: {
@@ -44,6 +45,14 @@ module.exports = (env, argv) => {
           { from: 'src/offscreen/ocr.html', to: 'offscreen.html' },
           { from: 'icons', to: 'icons', noErrorOnMissing: true },
           { from: 'models', to: 'models', noErrorOnMissing: true },
+          // ONNX Runtime Web WASM files — needed by YOLOS-Tiny WASM fallback.
+          // WebGPU path does not require these files.
+          {
+            from: 'node_modules/onnxruntime-web/dist',
+            to: 'ort-wasm',
+            filter: async (resourcePath) => resourcePath.endsWith('.wasm'),
+            noErrorOnMissing: true,
+          },
         ],
       }),
     ],

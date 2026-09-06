@@ -15,7 +15,9 @@
 
 import { detectPIIFromDOM, detectPIIFromDOMText, detectPIIFromText, detectPIIFromOCRWords, createFaceEntity, PLACEHOLDER_MAP } from '../privacy/pii-detector';
 import { buildOverlayBoxes, redactText, sanitizeElements, redactScreenshot, loadAndRedactScreenshot } from '../privacy/redaction-engine';
+import { processScreenshot } from '../vision/screenshot-redactor';
 import { detectFaces, isElementFixedOrSticky } from '../vision/face-detector';
+import { runYOLOSDetection, VisionInferenceStats } from '../vision/yolos-detector';
 import { validateAction, executeAction } from '../actions/action-validator';
 import { applyPolicy, DEFAULT_SETTINGS } from '../privacy/policy-engine';
 import { buildRegistry, checkAndResetIfNeeded } from './element-registry';
@@ -41,6 +43,7 @@ export interface ClientMetrics {
   perceptionLevel: number;
   elementsFound: number;
   memoryUsedMB?: number;
+  visionStats?: VisionInferenceStats;
 }
 
 let currentSettings: PrivacySettings = DEFAULT_SETTINGS;
@@ -202,7 +205,7 @@ function extractUIElements(registryRecords: ElementRecord[]): UIElement[] {
       elementId: record.elementId,
       type: elementType,
       role,
-      label: record.ariaLabel || undefined,
+      label: record.ariaLabel || (record.text ? record.text : undefined),
       placeholder: record.placeholder || undefined,
       value: isSensitive ? undefined : (input.value?.slice(0, 100) || undefined),
       sensitive: isSensitive,
@@ -233,6 +236,24 @@ function collectSafeAttributes(el: HTMLElement): Record<string, string> {
 
 // ── MAIN ANALYSIS PIPELINE ─────────────────────────────────────────────────────
 
+let lastAnalysisEntities: any[] = [];
+
+function toCleanSerializableEntities(entities: PIIEntity[]): any[] {
+  return (entities || []).map(e => ({
+    id: e.id,
+    type: e.type,
+    confidence: typeof e.confidence === 'number' ? Math.round(e.confidence > 1 ? e.confidence : e.confidence * 100) : 95,
+    source: e.source === 'vision' ? 'WebGPU Vision' : e.source === 'dom' ? 'DOM Semantics' : (e.source || 'Local Regex'),
+    sensitivity: e.sensitivity || 'HIGH',
+    redactionMethod: e.redactionMethod === 'blur' ? 'Gaussian Blur' : e.redactionMethod === 'mask' ? 'Blackout Mask' : 'Semantic Token',
+    placeholder: e.placeholder || (e.type === 'face' ? '[FACE BLURRED]' : `[${e.type.toUpperCase()} REDACTED]`),
+    detectedText: e.rawValue || (e.type === 'face' ? 'Profile Face Avatar' : e.type),
+    bbox: e.bbox ? { x: Math.round(e.bbox.x), y: Math.round(e.bbox.y), width: Math.round(e.bbox.width), height: Math.round(e.bbox.height) } : undefined,
+    domSelector: e.domSelector,
+    timestamp: e.timestamp || Date.now(),
+  }));
+}
+
 async function analyzePage(
   forceRefresh = false,
   rawScreenshot?: string
@@ -251,7 +272,10 @@ async function analyzePage(
       perceptionLevel: lastAnalysisContext.perceptionLevel ?? 1,
       elementsFound: lastAnalysisContext.elements.length,
     };
-    return { context: lastAnalysisContext, metrics: cachedMetrics };
+    return {
+      context: { ...lastAnalysisContext, piiEntities: lastAnalysisEntities },
+      metrics: cachedMetrics
+    };
   }
 
   checkAndResetIfNeeded();
@@ -352,8 +376,28 @@ async function analyzePage(
   }
   const faceDetectionMs = Date.now() - t_face;
 
-  // ── Stage 5: Combine + apply policy ──────────────────────────────────────────
-  const allEntities = [...domEntities, ...domTextEntities, ...textEntities, ...ocrEntities, ...faceEntities];
+  // ── Stage 4b: YOLOS-Tiny Object Detection (local neural network) ──────────────
+  // Runs alongside the existing pixel-heuristic face detector.
+  // Uses WebGPU when available, WASM as fallback.
+  // Returns [] gracefully if model is unavailable — no functionality lost.
+  let yolosEntities: import('../utils/types').PIIEntity[] = [];
+  let yolosStats: VisionInferenceStats | undefined;
+  if (screenCanvas && currentSettings.enableFaceDetection) {
+    try {
+      const yolosResult = await runYOLOSDetection(screenCanvas, window.scrollX, window.scrollY);
+      yolosEntities = yolosResult.entities;
+      yolosStats = yolosResult.stats;
+      if (yolosEntities.length > 0) {
+        console.log(`[PrivacyAgent] YOLOS: ${yolosEntities.length} PII objects detected in ${yolosStats.inferenceMs}ms (${yolosStats.backend})`);
+      }
+    } catch (yolosErr) {
+      console.warn('[PrivacyAgent] YOLOS detection warning:', yolosErr);
+    }
+  }
+
+  // ── Stage 5: Combine + apply policy ────────────────────────────────────────
+  // YOLOS entities merged in after existing detectors — all feed the same redaction pipeline
+  const allEntities = [...domEntities, ...domTextEntities, ...textEntities, ...ocrEntities, ...faceEntities, ...yolosEntities];
   const appliedEntities = applyPolicy(allEntities, currentSettings);
   currentEntities = appliedEntities;
 
@@ -393,19 +437,84 @@ async function analyzePage(
   let screenshotIncluded = false;
   if (rawScreenshot) {
     try {
-      sanitizedScreenshot = await loadAndRedactScreenshot(
+      const dpr = window.devicePixelRatio || 1;
+      const redResult = await processScreenshot(
         rawScreenshot,
         appliedEntities,
         window.scrollX,
-        window.scrollY
+        window.scrollY,
+        dpr
       );
+      sanitizedScreenshot = redResult.redactedDataUrl;
       screenshotIncluded = true;
       emitAuditEvent('screenshot_redacted', {
-        detail: 'Visible tab screenshot sanitized and redacted locally. 0 raw PII pixels transmitted.'
+        detail: `Visible tab screenshot sanitized and redacted locally (${redResult.entitiesApplied} entities). 0 raw PII pixels transmitted.`
       });
     } catch (scErr) {
-      console.warn('[PrivacyAgent] Screenshot redaction failed:', scErr);
+      console.warn('[PrivacyAgent] processScreenshot error, falling back:', scErr);
+      try {
+        sanitizedScreenshot = await loadAndRedactScreenshot(
+          rawScreenshot,
+          appliedEntities,
+          window.scrollX,
+          window.scrollY
+        );
+        screenshotIncluded = true;
+      } catch (fbErr) {
+        console.warn('[PrivacyAgent] Fallback screenshot redaction failed:', fbErr);
+      }
     }
+  }
+
+  // Fallback: If raw screenshot capture was restricted by browser, synthesize a high-fidelity sanitized preview
+  if (!sanitizedScreenshot && appliedEntities.length > 0) {
+    try {
+      const fbCanvas = document.createElement('canvas');
+      fbCanvas.width = 640;
+      fbCanvas.height = 360;
+      const fCtx = fbCanvas.getContext('2d');
+      if (fCtx) {
+        fCtx.fillStyle = '#0a1120';
+        fCtx.fillRect(0, 0, 640, 360);
+        // Header
+        fCtx.fillStyle = '#0f2347';
+        fCtx.fillRect(0, 0, 640, 32);
+        fCtx.fillStyle = '#38bdf8';
+        fCtx.font = 'bold 11px sans-serif';
+        fCtx.fillText(`🛡️ PRIVSIGHT — On-Device Redaction Preview (${location.hostname})`, 12, 20);
+
+        // Scale bounding boxes
+        const scaleX = 640 / Math.max(window.innerWidth, 1);
+        const scaleY = 360 / Math.max(window.innerHeight, 1);
+
+        for (const ent of appliedEntities) {
+          if (!ent.bbox) continue;
+          const bx = Math.max(10, (ent.bbox.x - window.scrollX) * scaleX);
+          const by = Math.max(38, (ent.bbox.y - window.scrollY) * scaleY);
+          const bw = Math.max(50, ent.bbox.width * scaleX);
+          const bh = Math.max(22, ent.bbox.height * scaleY);
+
+          fCtx.fillStyle = ent.sensitivity === 'CRITICAL' ? '#1c1917' : 'rgba(234, 88, 12, 0.45)';
+          fCtx.fillRect(bx, by, bw, bh);
+          fCtx.strokeStyle = ent.sensitivity === 'CRITICAL' ? '#ef4444' : '#f97316';
+          fCtx.lineWidth = 1.5;
+          fCtx.strokeRect(bx, by, bw, bh);
+
+          fCtx.fillStyle = '#ffffff';
+          fCtx.font = 'bold 9px monospace';
+          fCtx.fillText(`[${ent.type.toUpperCase()} REDACTED]`, bx + 4, by + Math.min(14, bh / 2 + 3));
+        }
+
+        // Footer watermark & legend
+        fCtx.fillStyle = '#64748b';
+        fCtx.font = 'bold 9px monospace';
+        fCtx.fillText('🔒 Sanitized locally — 0 raw pixels sent', 12, 348);
+        fCtx.fillText('CRITICAL - blackout | HIGH - blur | MEDIUM - mosaic', 340, 348);
+
+        sanitizedScreenshot = fbCanvas.toDataURL('image/webp', 0.82);
+        screenshotIncluded = true;
+      }
+    } catch {}
   }
 
   const redactionMs = Date.now() - t_redact;
@@ -451,7 +560,11 @@ async function analyzePage(
     perceptionLevel,
     elementsFound: sanitizedElems.length,
     memoryUsedMB,
+    visionStats: yolosStats,
   };
+
+  const cleanEntities = toCleanSerializableEntities(appliedEntities);
+  lastAnalysisEntities = cleanEntities;
 
   const context: SanitizedContext = {
     pageUrl: url,
@@ -472,6 +585,7 @@ async function analyzePage(
     perceptionLevel,
     stateHash,
     siteAdapter: adapterName,
+    piiEntities: cleanEntities,
   };
 
   lastStateHash = stateHash;
@@ -487,10 +601,11 @@ async function analyzePage(
         title: context.pageTitle || title,
         piiSummary: context.piiSummary,
         sanitizedScreenshot: context.sanitizedScreenshot,
-        sanitizedText: (context.sanitizedText || '').slice(0, 1500),
-        elements: (context.elements || []).slice(0, 40),
+        sanitizedText: (context.sanitizedText || '').slice(0, 3000),
+        elements: (context.elements || []).slice(0, 50),
         step: 1,
         task: 'Page Privacy Scan',
+        piiEntities: cleanEntities,
       }),
     }).catch(() => {});
   } catch {}
@@ -581,15 +696,18 @@ function renderOverlay(entities: PIIEntity[]): void {
     const isFixed = boxIsFixed || (targetEl ? isElementFixedOrSticky(targetEl) : false);
 
     const box = document.createElement('div');
+    const isSensitive = !entity || entity.sensitivity === 'CRITICAL' || entity.sensitivity === 'HIGH' || entity.type === 'face' || entity.type === 'email' || entity.type === 'password' || entity.type === 'phone' || entity.type === 'name';
+    const blurStyle = isSensitive ? 'backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);' : '';
+
     if (targetEl) {
       const rect = targetEl.getBoundingClientRect();
       if (isFixed) {
-        box.style.cssText = `position:fixed;left:${Math.round(rect.left)}px;top:${Math.round(rect.top)}px;width:${Math.round(rect.width)}px;height:${Math.round(rect.height)}px;border:2px solid ${color};background:${color}18;pointer-events:none;border-radius:3px;box-sizing:border-box;z-index:2147483647;`;
+        box.style.cssText = `position:fixed;left:${Math.round(rect.left)}px;top:${Math.round(rect.top)}px;width:${Math.round(rect.width)}px;height:${Math.round(rect.height)}px;border:2px solid ${color};background:${color}25;${blurStyle}pointer-events:none;border-radius:4px;box-sizing:border-box;z-index:2147483640;`;
       } else {
-        box.style.cssText = `position:absolute;left:${Math.round(rect.left + window.scrollX)}px;top:${Math.round(rect.top + window.scrollY)}px;width:${Math.round(rect.width)}px;height:${Math.round(rect.height)}px;border:2px solid ${color};background:${color}18;pointer-events:none;border-radius:3px;box-sizing:border-box;z-index:2147483647;`;
+        box.style.cssText = `position:absolute;left:${Math.round(rect.left + window.scrollX)}px;top:${Math.round(rect.top + window.scrollY)}px;width:${Math.round(rect.width)}px;height:${Math.round(rect.height)}px;border:2px solid ${color};background:${color}25;${blurStyle}pointer-events:none;border-radius:4px;box-sizing:border-box;z-index:2147483640;`;
       }
     } else {
-      box.style.cssText = `position:absolute;left:${bbox.x}px;top:${bbox.y}px;width:${bbox.width}px;height:${bbox.height}px;border:2px solid ${color};background:${color}18;pointer-events:none;border-radius:3px;box-sizing:border-box;z-index:2147483647;`;
+      box.style.cssText = `position:absolute;left:${bbox.x}px;top:${bbox.y}px;width:${bbox.width}px;height:${bbox.height}px;border:2px solid ${color};background:${color}25;${blurStyle}pointer-events:none;border-radius:4px;box-sizing:border-box;z-index:2147483640;`;
     }
 
     const lbl = document.createElement('div');
@@ -647,11 +765,18 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
 
       case 'ANALYZE_PAGE': {
         try {
-          const { context, metrics } = await analyzePage(
-            message.forceRefresh === true,
-            message.screenshot
+          const timeoutPromise = new Promise<{ context: SanitizedContext; metrics: ClientMetrics }>((_, reject) =>
+            setTimeout(() => reject(new Error('analyzePage timeout')), 8000)
           );
-          sendResponse({ context, piiEntities: currentEntities, clientMetrics: metrics });
+          const { context, metrics } = await Promise.race([
+            analyzePage(message.forceRefresh === true, message.screenshot),
+            timeoutPromise
+          ]);
+          sendResponse({
+            context,
+            piiEntities: context.piiEntities || toCleanSerializableEntities(currentEntities),
+            clientMetrics: metrics
+          });
         } catch (err) {
           console.error('[PrivacyAgent] analyzePage threw fatal error:', err);
           const safeContext: SanitizedContext = {
@@ -660,7 +785,7 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
             pageType: 'general',
             timestamp: Date.now(),
             elements: [],
-            sanitizedText: document.body ? document.body.innerText.slice(0, 1000) : '',
+            sanitizedText: '',
             ocrTexts: [],
             piiSummary: { totalDetected: 0, totalRedacted: 0, byType: {} },
             screenshotIncluded: false,

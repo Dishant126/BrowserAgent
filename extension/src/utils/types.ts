@@ -71,6 +71,7 @@ export type ActionType =
 export interface ActionTarget {
   type?: string;
   value?: string;
+  elementId?: string;
 }
 
 export interface BrowserAction {
@@ -93,6 +94,7 @@ export interface ActionResult {
   error?: string;
   executedAt: number;
   latencyMs: number;
+  isFileUploadTrigger?: boolean;
 }
 
 export interface PrivacySettings {
@@ -148,9 +150,48 @@ export interface SanitizedContext {
   perceptionLevel?: 1 | 2 | 3 | 4;
   stateHash?: string;
   siteAdapter?: string;
+  piiEntities?: any[];
 }
 
 export type AuditEventType = 'pii_detected' | 'action_blocked' | 'action_executed' | 'data_sent' | 'screenshot_redacted';
+
+// ── CHAT SESSION ──────────────────────────────────────────────────────────────
+
+/** Discriminated kind for each chat bubble in the Live Session feed */
+export type ChatMessageKind = 'user' | 'assistant' | 'status' | 'screenshot' | 'confirmation' | 'error';
+
+export interface ChatMessage {
+  id: string;
+  kind: ChatMessageKind;
+  /** Message text (omitted for screenshot-only messages) */
+  text?: string;
+  timestamp: number;
+  /**
+   * Sanitized/redacted screenshot data URL.
+   * The original sensitive screenshot is NEVER stored or transmitted.
+   */
+  screenshot?: string;
+  /** Number of PII entities redacted before this screenshot was captured */
+  piiCount?: number;
+  totalPiiRedacted?: number;
+  piiTypes?: string[];
+  /** Structured action proposal for confirmation */
+  action?: BrowserAction;
+  actionId?: string;
+  confidence?: number;
+  confirmed?: 'yes' | 'no' | boolean | null; // null: waiting for user, 'yes'/true: user approved, 'no'/false: user cancelled
+  actionPill?: string | {
+    action: string;
+    target?: string;
+    confidence?: number;
+  };
+  visionStats?: {
+    model?: string;
+    backend?: string;
+    inferenceMs?: number;
+    detectionCount?: number;
+  };
+}
 
 export interface AuditEvent {
   id: string;
@@ -168,6 +209,36 @@ export interface OcrWord {
   text: string;
   confidence: number;
   bbox: BoundingBox;
+}
+
+// ── TRACE EVENT STREAM ─────────────────────────────────────────────────────────
+
+export type TraceEventType =
+  | 'PROMPT_RECEIVED'
+  | 'SCAN_STARTED'
+  | 'DOM_ANALYSIS'
+  | 'VISION_STARTED'
+  | 'VISION_COMPLETED'
+  | 'PII_DETECTED'
+  | 'REDACTION_COMPLETED'
+  | 'SANITIZED_CONTEXT_CREATED'
+  | 'SERVER_REQUEST'
+  | 'SERVER_RESPONSE'
+  | 'ACTION_PROPOSED'
+  | 'USER_CONFIRMATION'
+  | 'ACTION_EXECUTED'
+  | 'ACTION_VERIFIED'
+  | 'TASK_COMPLETED'
+  | 'ERROR';
+
+export interface TraceEvent {
+  id: string;
+  sessionId: string;
+  type: TraceEventType;
+  detail: string;
+  step?: number;
+  timestamp: number;
+  metadata?: Record<string, any>;
 }
 
 // ── ELEMENT REGISTRY ───────────────────────────────────────────────────────────
@@ -193,21 +264,27 @@ export interface ElementRecord {
 
 export type TaskState =
   | 'IDLE'
+  | 'SCANNING'
+  | 'VISION_PROCESSING'
+  | 'PRIVACY_PROCESSING'
+  | 'THINKING'
+  | 'WAITING_FOR_CONFIRMATION'
+  | 'EXECUTING'
+  | 'VERIFYING'
+  | 'COMPLETED'
+  | 'ERROR'
   | 'UNDERSTANDING'
   | 'PERCEIVING'
   | 'SANITIZING'
   | 'PLANNING'
   | 'VALIDATING'
-  | 'EXECUTING'
   | 'WAITING_FOR_PAGE'
   | 'RE_PERCEIVING'
-  | 'COMPLETED'
   | 'PRIVACY_BLOCKED'
   | 'ACTION_INVALID'
   | 'LOW_CONFIDENCE'
   | 'UNSUPPORTED_SITE'
-  | 'USER_REQUIRED'
-  | 'ERROR';
+  | 'USER_REQUIRED';
 
 // ── SITE COMPATIBILITY ─────────────────────────────────────────────────────────
 
@@ -228,8 +305,10 @@ export type ExtensionMessage =
   | { type: 'ACTION_REQUEST'; action: BrowserAction; actionId?: string }
   | { type: 'SETTINGS_UPDATE'; settings: PrivacySettings }
   | { type: 'GET_STATUS' }
-  | { type: 'START_TASK'; instruction: string; targetUrl?: string; sessionId?: string }
+  | { type: 'START_TASK'; instruction: string; targetUrl?: string; sessionId?: string; tabId?: number }
   | { type: 'STOP_TASK' }
+  | { type: 'CLEAR_CHAT' }
+  | { type: 'RESCAN_PAGE' }
   | { type: 'OCR_REQUEST'; imageData: string }
   | { type: 'AUDIT_EVENT'; event: AuditEvent }
   | { type: 'STATUS_UPDATE'; status: string; taskState?: TaskState }
@@ -242,4 +321,11 @@ export type ExtensionMessage =
   | { type: 'ACTION_APPROVAL_REQUEST'; action: BrowserAction; actionId: string; confidence: number }
   | { type: 'ACTION_APPROVAL_RESPONSE'; approved: boolean; actionId: string }
   | { type: 'TOGGLE_FLOATING_PANEL'; show?: boolean }
-  | { type: 'FALLBACK_MODE'; reason: string };
+  | { type: 'FALLBACK_MODE'; reason: string }
+  | { type: 'CHAT_MESSAGE'; message: ChatMessage }
+  | { type: 'TRACE_EVENT'; event: TraceEvent }
+  | { type: 'CAPTURE_SCREENSHOT' }
+  | { type: 'VIT_INFERENCE'; imageData?: string; requestId?: string; threshold?: number }
+  | { type: 'VERIFY_PII'; candidates?: string[]; url?: string }
+  | { type: 'REDACTED_PREVIEW'; dataUrl?: string; entitiesApplied?: number; piiTypes?: string[] };
+

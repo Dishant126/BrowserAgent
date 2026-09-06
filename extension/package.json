@@ -9,6 +9,7 @@
     "build:dev": "webpack --mode development"
   },
   "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
     "onnxruntime-web": "^1.29.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",

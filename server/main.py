@@ -51,6 +51,7 @@ app.add_middleware(
 )
 
 app.include_router(router, prefix="/api")
+app.include_router(router)  # Fallback for clients calling /action, /verify-pii without /api
 
 
 @app.get("/")
