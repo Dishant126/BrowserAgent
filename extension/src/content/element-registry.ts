@@ -79,8 +79,11 @@ export function buildRegistry(): ElementRecord[] {
     if (rect.width === 0 && rect.height === 0) return;
     if (rect.top > window.innerHeight + 500) return; // far off-screen
 
-    const selector = buildStableSelector(el);
-    if (seen.has(selector)) return;
+    let selector = buildStableSelector(el);
+    if (seen.has(selector)) {
+      // Ensure selector uniqueness so distinct interactive buttons/links are never discarded
+      selector = `${selector}#item-${counter + 1}`;
+    }
     seen.add(selector);
 
     const elementId = `el_${String(++counter).padStart(3, '0')}`;
@@ -124,8 +127,8 @@ export function buildRegistry(): ElementRecord[] {
 }
 
 /**
- * Resolve a stable element ID to the actual DOM element.
- * Returns null if not found (element may have been removed from DOM).
+ * Resolve an el_NNN ID back to a live DOM element.
+ * If the element was removed from the DOM, returns null.
  */
 export function resolveElementId(elementId: string): Element | null {
   const entry = registry.get(elementId);
@@ -176,6 +179,14 @@ function buildStableSelector(el: HTMLElement): string {
     return `${el.tagName.toLowerCase()}[name="${CSS.escape(name)}"]`;
   }
 
+  // Priority 2.5: Unique href for anchor tags
+  if (el.tagName === 'A') {
+    const href = el.getAttribute('href');
+    if (href && href.length < 100 && !href.startsWith('javascript:')) {
+      return `a[href="${href.replace(/"/g, '\\"')}"]`;
+    }
+  }
+
   // Priority 3: data-testid or data-qa
   const testId = el.getAttribute('data-testid') || el.getAttribute('data-qa') || el.getAttribute('data-cy');
   if (testId) return `[data-testid="${CSS.escape(testId)}"]`;
@@ -199,6 +210,14 @@ function buildStableSelector(el: HTMLElement): string {
     if (siblings.length > 1 && idx >= 0) {
       const clsStr = classes.length ? `.${classes.map(c => CSS.escape(c)).join('.')}` : '';
       return `${tag}${clsStr}:nth-of-type(${idx + 1})`;
+    }
+    // Disambiguate list item wrappers (e.g. <ul><li><a /></li></ul>)
+    if (parent.tagName === 'LI' && parent.parentElement) {
+      const parentSiblings = Array.from(parent.parentElement.children).filter(c => c.tagName === 'LI');
+      const pIdx = parentSiblings.indexOf(parent);
+      if (parentSiblings.length > 1 && pIdx >= 0) {
+        return `li:nth-of-type(${pIdx + 1}) > ${tag}`;
+      }
     }
   }
 

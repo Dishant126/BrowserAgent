@@ -72,6 +72,8 @@ export interface ActionTarget {
   type?: string;
   value?: string;
   elementId?: string;
+  friendlyName?: string;
+  label?: string;
 }
 
 export interface BrowserAction {
@@ -127,6 +129,7 @@ export interface UIElement {
   ariaLabel?: string;
   ariaRole?: string;
   accessibleName?: string;
+  text?: string;
 }
 
 export interface PiiSummary {
@@ -325,6 +328,7 @@ export type ExtensionMessage =
   | { type: 'CHAT_MESSAGE'; message: ChatMessage }
   | { type: 'TRACE_EVENT'; event: TraceEvent }
   | { type: 'CAPTURE_SCREENSHOT' }
+  | { type: 'CLEAR_OVERLAYS' }
   | { type: 'VIT_INFERENCE'; imageData?: string; requestId?: string; threshold?: number }
   | { type: 'VERIFY_PII'; candidates?: string[]; url?: string }
   | { type: 'REDACTED_PREVIEW'; dataUrl?: string; entitiesApplied?: number; piiTypes?: string[] };

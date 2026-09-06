@@ -52,13 +52,12 @@ def get_llm() -> Any:
         if not api_key or api_key in ("your_gemini_api_key_here", ""):
             print("[Reasoner] No GOOGLE_API_KEY. Using DynamicDOMSolver fallback.")
             return DynamicDOMSolverLLM()
-        model_name = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
         from langchain_google_genai import ChatGoogleGenerativeAI
         print(f"[Reasoner] Using Gemini model: {model_name}")
         return ChatGoogleGenerativeAI(
             model=model_name,
             google_api_key=api_key,
-            temperature=0.1,
         )
 
     elif provider == "openai":
@@ -242,8 +241,11 @@ Return the SINGLE best NEXT action as JSON only."""
 
 # ── RESPONSE PARSER ───────────────────────────────────────────────────────────
 
-def parse_action_response(text) -> BrowserAction:
-    """Parse LLM response — handles strings, lists, <think> tags, and trailing metadata."""
+def parse_action_response(text: Any, context: Optional[SanitizedContext] = None, task: Optional[str] = None) -> BrowserAction:
+    """
+    Parse LLM response into a validated BrowserAction.
+    Enriches action.target with human-friendly button/link label from context.elements.
+    """
     if isinstance(text, list):
         parts = []
         for item in text:
@@ -256,17 +258,15 @@ def parse_action_response(text) -> BrowserAction:
     if not isinstance(text, str):
         text = str(text)
 
-    # 1. Strip <think>...</think> reasoning blocks from thinking models (e.g. Qwen, DeepSeek)
+    # 1. Strip <think>...</think> reasoning blocks
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
 
     # 2. Strip markdown code blocks
     text = re.sub(r'^```(?:json)?\s*', '', text, flags=re.MULTILINE)
     text = re.sub(r'\s*```$', '', text, flags=re.MULTILINE).strip()
 
-    data = None
-    # 3. Try standard json.loads
     try:
-        data = json.loads(text)
+        data = json.loads(text.strip())
     except json.JSONDecodeError:
         m = re.search(r'\{.*\}', text, re.DOTALL)
         if m:
@@ -294,13 +294,44 @@ def parse_action_response(text) -> BrowserAction:
             t_val = str(t_data.get("elementId") or t_data.get("value") or "")
             t_type = str(t_data.get("type", "element-id"))
             if t_val:
-                target = ActionTarget(type=t_type if t_type in ("selector", "element-id", "role", "text") else "element-id", value=t_val, elementId=t_val)
+                target = ActionTarget(
+                    type=t_type if t_type in ("selector", "element-id", "role", "text") else "element-id",
+                    value=t_val,
+                    elementId=t_val,
+                    friendlyName=t_data.get("friendlyName"),
+                    label=t_data.get("label"),
+                )
         elif isinstance(t_data, str):
             # LLM sometimes returns target as a plain string
             target = ActionTarget(type="element-id", value=t_data, elementId=t_data)
 
+    # ── Resolve friendly human-readable name from context elements ─────────
+    friendly_name = ""
+    if target and context and getattr(context, "elements", None):
+        clean_target_id = (target.elementId or target.value or "").replace("#", "").strip().lower()
+        for el in context.elements:
+            el_id = (getattr(el, "elementId", None) or el.id or "").replace("#", "").strip().lower()
+            el_sel = (getattr(el, "domSelector", "") or "").strip().lower()
+            if clean_target_id and (el_id == clean_target_id or el_sel == clean_target_id):
+                raw_label = getattr(el, "label", None) or getattr(el, "ariaLabel", None) or getattr(el, "role", None) or getattr(el, "text", None) or ""
+                cleaned = re.sub(r'^(PDF tool link:|link:|button:|tab:|menuitem:)\s*', '', str(raw_label), flags=re.IGNORECASE).strip()
+                if cleaned:
+                    friendly_name = cleaned
+                    target.friendlyName = cleaned
+                    target.label = cleaned
+                    break
+
     reason = data.get("reason", "LLM decision")
-    requires_approval = bool(data.get("requiresApproval", False))
+    task_str = (task or "").lower().strip()
+    is_find_intent = any(task_str.startswith(w) or f" {w} " in f" {task_str} " for w in ["find", "locate", "search for", "where is", "show me"])
+
+    # If friendly name is resolved, clean any raw '#el_004' references in reason
+    if friendly_name:
+        reason = re.sub(r'#?el_\d+', f'"{friendly_name}"', reason)
+        if is_find_intent and action_type == "click":
+            reason = f'I found the "{friendly_name}" button. Would you like me to click it?'
+
+    requires_approval = bool(data.get("requiresApproval", False)) or (is_find_intent and action_type == "click")
     if any(w in reason.lower() for w in ["shall i", "approve", "select pdf files", "select files", "choose files", "open file explorer", "would you like me to"]):
         requires_approval = True
 
@@ -752,8 +783,13 @@ async def reason(
 
     provider = os.getenv("LLM_PROVIDER", "gemini").lower()
 
-    # Multimodal image handling: if sanitized screenshot is attached, pass it to VLM
-    has_image = bool(getattr(context, "sanitizedScreenshot", None) and getattr(context, "screenshotIncluded", False))
+    # Multimodal image handling: pass screenshot to VLM ONLY when DOM elements are absent or perceptionLevel >= 4
+    interactables = [e for e in getattr(context, "elements", []) if getattr(e, "interactable", True) and getattr(e, "visible", True)]
+    has_image = bool(
+        getattr(context, "sanitizedScreenshot", None) and
+        getattr(context, "screenshotIncluded", False) and
+        (len(interactables) == 0 or getattr(context, "perceptionLevel", 1) >= 4)
+    )
     if has_image and provider in ("gemini", "openai"):
         raw_screen = getattr(context, "sanitizedScreenshot", None) or ""
         image_url = str(raw_screen)
@@ -769,13 +805,23 @@ async def reason(
 
     t0 = time.time()
     try:
-        response = await llm.ainvoke(messages)
+        if provider == "gemini":
+            import asyncio
+            response = await asyncio.to_thread(llm.invoke, messages)
+        else:
+            response = await llm.ainvoke(messages)
         latency_ms = int((time.time() - t0) * 1000)
-        raw_text = response.content if isinstance(response.content, str) else str(response.content)
-        action = parse_action_response(raw_text)
+        if isinstance(response.content, list):
+            raw_text = "\n".join(
+                part.get("text", "") if isinstance(part, dict) else str(part)
+                for part in response.content
+            )
+        else:
+            raw_text = str(response.content)
+        action = parse_action_response(raw_text, context=context, task=task)
         model_map = {
             "groq": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
-            "gemini": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
+            "gemini": os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite"),
             "openai": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             "anthropic": os.getenv("ANTHROPIC_MODEL", "claude-haiku-20240307"),
         }
@@ -794,7 +840,7 @@ async def reason(
         r2 = await solver.ainvoke(text_messages)
         latency_ms = int((time.time() - t0) * 1000)
         raw_text = r2.content if isinstance(r2.content, str) else str(r2.content)
-        action = parse_action_response(raw_text)
+        action = parse_action_response(raw_text, context=context, task=task)
         print(f"[Reasoner] Fallback solver step {step} -> {action.action}")
         return action, latency_ms, "fallback-solver", full_prompt, raw_text
 

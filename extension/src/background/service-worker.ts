@@ -79,6 +79,67 @@ function broadcastToAll(msg: any) {
   }
 }
 
+function cleanElementLabel(raw: string): string {
+  if (!raw) return '';
+  let s = raw.replace(/^(PDF tool link:|link:|button:|tab:|menuitem:|heading:|input:)\s*/i, '').trim();
+  s = s.replace(/^["']|["']$/g, '').trim();
+  if (s.length > 40) {
+    s = s.slice(0, 38) + '…';
+  }
+  return s;
+}
+
+function resolveFriendlyTargetName(action: BrowserAction, elements: any[] = []): string {
+  const target = action.target;
+  if (!target) return '';
+
+  // 1. Direct from server-side enriched properties
+  if (target.friendlyName) return cleanElementLabel(target.friendlyName);
+  if (target.label) return cleanElementLabel(target.label);
+
+  // 2. Lookup in client DOM elements using elementId, id, or domSelector
+  const targetId = (target.elementId || target.value || '').replace(/^#/, '').trim().toLowerCase();
+  if (targetId && elements && elements.length > 0) {
+    const found = elements.find((e: any) => {
+      const eid = (e.elementId || e.id || '').replace(/^#/, '').trim().toLowerCase();
+      const sel = (e.domSelector || '').trim().toLowerCase();
+      return (eid && eid === targetId) || (sel && sel === targetId);
+    });
+    if (found) {
+      const candidate = found.label || found.ariaLabel || found.role || found.text;
+      if (candidate) {
+        const cleaned = cleanElementLabel(candidate);
+        if (cleaned) return cleaned;
+      }
+    }
+  }
+
+  // 3. Extract quoted name from action.reason (e.g. "Click on the 'Compress PDF' tool link...")
+  if (action.reason) {
+    const quotedMatch = action.reason.match(/['"]([^'"]+)['"]/);
+    if (quotedMatch && quotedMatch[1]) {
+      const candidate = cleanElementLabel(quotedMatch[1]);
+      if (candidate && !candidate.startsWith('el_') && !candidate.startsWith('#el_')) {
+        return candidate;
+      }
+    }
+    const clickMatch = action.reason.match(/click (?:on )?(?:the )?([A-Za-z0-9\s]+?)(?: button| link| tool| tab)/i);
+    if (clickMatch && clickMatch[1]) {
+      const candidate = cleanElementLabel(clickMatch[1]);
+      if (candidate && !candidate.startsWith('el_')) {
+        return candidate;
+      }
+    }
+  }
+
+  // 4. If target.value is already a readable human string (not an ID like el_001)
+  if (target.value && !target.value.startsWith('el_') && !target.value.startsWith('#el_') && !target.value.startsWith('.')) {
+    return cleanElementLabel(target.value);
+  }
+
+  return '';
+}
+
 /**
  * Emit a real runtime trace event to popup, floating panel, and server.
  */
@@ -528,11 +589,15 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
 
       emitTraceEvent('SERVER_RESPONSE', `AI response received (${latencyMs}ms)`, stepNum, { latencyMs, model: modelUsed });
 
-      const targetDesc = action.target?.elementId ? `#${action.target.elementId}` : (action.target?.value || '');
+      // Resolve human-readable element name (e.g. "Compress PDF", "Repositories", "Split PDF")
+      const targetFriendlyName = resolveFriendlyTargetName(action, context.elements || []);
+      const displayTarget = targetFriendlyName ? `"${targetFriendlyName}"` : (action.target?.elementId ? `#${action.target.elementId}` : (action.target?.value || ''));
       const confPercent = Math.round(confidence * 100);
-      const actionPill = `${action.action.toUpperCase()} ${targetDesc} ${confPercent}% conf`.trim();
+      const actionPill = targetFriendlyName
+        ? `${action.action.toUpperCase()} "${targetFriendlyName}" ${confPercent}% conf`.trim()
+        : `${action.action.toUpperCase()} ${displayTarget} ${confPercent}% conf`.trim();
 
-      emitTraceEvent('ACTION_PROPOSED', `Proposed action: ${action.action.toUpperCase()} on ${targetDesc || 'page'} (${confPercent}% conf)`, stepNum, {
+      emitTraceEvent('ACTION_PROPOSED', `Proposed action: ${action.action.toUpperCase()} on ${displayTarget || 'page'} (${confPercent}% conf)`, stepNum, {
         action,
         confidence,
       });
@@ -605,9 +670,11 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
 
       if (requiresConfirm) {
         setTaskState('WAITING_FOR_CONFIRMATION');
-        const confirmText = action.reason && action.reason.includes('?')
-          ? action.reason
-          : `I found the ${targetDesc || 'target'} button. Would you like me to click it?`;
+        const confirmText = targetFriendlyName
+          ? `I found the "${targetFriendlyName}" button. Would you like me to click it?`
+          : (action.reason && (action.reason.includes('?') || action.reason.startsWith('Shall I') || action.reason.startsWith('Would you'))
+              ? action.reason
+              : `I found the ${displayTarget || 'target'} button. Would you like me to click it?`);
         currentTask.conversationHistory.push({ role: 'assistant', text: confirmText });
 
         const confirmActionId = `approval-${stepNum}-${Date.now()}`;
@@ -633,10 +700,10 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
 
       // STEP 6: EXECUTING
       setTaskState('EXECUTING');
-      emitTraceEvent('ACTION_EXECUTED', `Executing ${action.action.toUpperCase()} on ${targetDesc}`, stepNum, { action });
+      emitTraceEvent('ACTION_EXECUTED', `Executing ${action.action.toUpperCase()} on ${displayTarget}`, stepNum, { action });
       broadcastChatMessage({
         kind: 'status',
-        text: `▶ Executing ${action.action.toUpperCase()} on ${targetDesc}...`,
+        text: `▶ Executing ${action.action.toUpperCase()} on ${displayTarget}...`,
       });
 
       const execResult = await sendMessageToTab(activeTabId, {
@@ -660,8 +727,11 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       // STEP 7: VERIFYING
       setTaskState('VERIFYING');
       broadcastChatMessage({ kind: 'status', text: '⏳ Verifying page state after action...' });
-      await waitForTabToSettle(activeTabId, 4000);
+      await waitForTabToSettle(activeTabId, 1200);
       emitTraceEvent('ACTION_VERIFIED', `Page state verified after ${action.action.toUpperCase()}`, stepNum);
+
+      // Clear any stale visual overlay boxes from the previous page
+      sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS' }).catch(() => {});
 
       currentTask.previousActions.push(action);
       currentTask.stepNumber++;
@@ -698,7 +768,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       if (isIntermediateNav) {
         broadcastChatMessage({
           kind: 'assistant',
-          text: `Opened PDF merger tool. Now scanning page to open file explorer...`,
+          text: `Opened tool page. Scanning new page elements...`,
           actionPill,
         });
         instructionStep++;
@@ -706,7 +776,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       }
 
       // If action had a single-turn completion
-      const assistantDoneText = `Done. ${action.reason || `Successfully executed ${action.action} on ${targetDesc}`}.`;
+      const assistantDoneText = `Done: ${action.reason || `Successfully executed ${action.action} on ${displayTarget}`}.`;
       currentTask.conversationHistory.push({ role: 'assistant', text: assistantDoneText });
       emitTraceEvent('TASK_COMPLETED', assistantDoneText, stepNum);
       broadcastChatMessage({
@@ -714,6 +784,10 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
         text: assistantDoneText,
         actionPill,
       });
+
+      // Clear old overlays on tab and trigger a clean scan of settled page
+      sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS' }).catch(() => {});
+      sendMessageToTab(activeTabId, { type: 'ANALYZE_PAGE', forceRefresh: true }).catch(() => {});
 
       setTaskState('COMPLETED');
       broadcastTaskDone(assistantDoneText);
@@ -846,9 +920,9 @@ const delay = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
  * Waits for the tab to completely finish loading and content script to be ready
  * before sending perception requests (especially important after navigation or clicks).
  */
-async function waitForTabToSettle(tabId: number, maxWaitMs = 15000): Promise<void> {
+async function waitForTabToSettle(tabId: number, maxWaitMs = 8000): Promise<void> {
   // Give click / navigation a brief window to initiate navigation state
-  await delay(800);
+  await delay(300);
   const start = Date.now();
 
   while (Date.now() - start < maxWaitMs) {
@@ -857,7 +931,7 @@ async function waitForTabToSettle(tabId: number, maxWaitMs = 15000): Promise<voi
 
     if (tab.status === 'complete') {
       // Tab reports complete. Wait for DOM and initial scripts to settle
-      await delay(700);
+      await delay(300);
 
       // Verify content script is responsive
       try {

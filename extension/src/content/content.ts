@@ -632,6 +632,7 @@ function updateOverlayPositions(): void {
 
   for (const item of trackedOverlayBoxes) {
     if (!item.targetEl || !document.body.contains(item.targetEl)) {
+      item.boxEl.style.display = 'none';
       continue;
     }
 
@@ -850,6 +851,13 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
         break;
       }
 
+      case 'CLEAR_OVERLAYS': {
+        clearOverlay();
+        checkAndResetIfNeeded();
+        sendResponse({ ok: true });
+        break;
+      }
+
       case 'TOGGLE_FLOATING_PANEL': {
         const isVisible = toggleFloatingPanel(message.show);
         sendResponse({ ok: true, visible: isVisible });
@@ -859,6 +867,38 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
   })();
   return true; // Keep message channel open for async response
 });
+
+// ── SPA / TURBO / PJAX NAVIGATION DETECTION ──────────────────────────────────
+let lastRecordedHref = location.href;
+function handleSpaNavigation() {
+  if (location.href !== lastRecordedHref) {
+    console.log('[PrivacyAgent] SPA Navigation detected:', lastRecordedHref, '->', location.href);
+    lastRecordedHref = location.href;
+    clearOverlay();
+    checkAndResetIfNeeded();
+  }
+}
+
+window.addEventListener('popstate', handleSpaNavigation);
+window.addEventListener('hashchange', handleSpaNavigation);
+window.addEventListener('turbo:render', () => { clearOverlay(); checkAndResetIfNeeded(); });
+window.addEventListener('turbo:load', () => { clearOverlay(); checkAndResetIfNeeded(); });
+document.addEventListener('pjax:end', () => { clearOverlay(); checkAndResetIfNeeded(); });
+
+try {
+  const origPush = history.pushState;
+  history.pushState = function(...args) {
+    const res = origPush.apply(this, args);
+    handleSpaNavigation();
+    return res;
+  };
+  const origReplace = history.replaceState;
+  history.replaceState = function(...args) {
+    const res = origReplace.apply(this, args);
+    handleSpaNavigation();
+    return res;
+  };
+} catch {}
 
 // ── WINDOW MESSAGE BRIDGE (DASHBOARD TO EXTENSION) ─────────────────────────────
 window.addEventListener('message', (event) => {

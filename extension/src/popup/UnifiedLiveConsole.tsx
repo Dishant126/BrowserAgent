@@ -79,9 +79,11 @@ const TASK_STATE_COLORS: Record<TaskState, string> = {
 
 function formatPill(pill?: string | { action: string; target?: string; confidence?: number }): string {
   if (!pill) return '';
-  if (typeof pill === 'string') return pill;
-  const conf = pill.confidence != null ? ` ${Math.round(pill.confidence * 100)}%` : '';
-  return `${pill.action.toUpperCase()} ${pill.target || ''}${conf}`.trim();
+  let str = typeof pill === 'string'
+    ? pill
+    : `${pill.action.toUpperCase()} ${pill.target || ''}${pill.confidence != null ? ` ${Math.round(pill.confidence * 100)}%` : ''}`.trim();
+  str = str.replace(/#?el_\d+/g, 'target');
+  return str;
 }
 
 /** Rich Screenshot & Redaction card displayed directly inside the chat feed */
@@ -288,7 +290,7 @@ function ChatBubble({
             ✋ User Confirmation Required
           </div>
           <div style={{ fontSize: 11, color: '#e2e8f0', lineHeight: 1.4, marginBottom: 6 }}>
-            {msg.text || 'Target action identified. Shall I proceed?'}
+            {(msg.text || 'Target action identified. Shall I proceed?').replace(/#el_\d+/g, 'button')}
           </div>
           {pillText && (
             <div style={{

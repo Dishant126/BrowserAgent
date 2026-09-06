@@ -1,0 +1,11 @@
+import sqlite3
+con = sqlite3.connect('privacy_agent.db')
+cur = con.cursor()
+row = cur.execute("SELECT id, session_id, step, action_type, raw_response, model_used, latency_ms FROM actions ORDER BY id DESC LIMIT 1").fetchone()
+print("ID:", row[0])
+print("Session:", row[1])
+print("Step:", row[2])
+print("Type:", row[3])
+print("Raw response:", row[4])
+print("Model:", row[5])
+print("Latency ms:", row[6])

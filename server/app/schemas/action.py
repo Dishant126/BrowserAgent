@@ -85,6 +85,8 @@ class ActionTarget(BaseModel):
     type: Optional[str] = "element-id"
     value: Optional[str] = None
     elementId: Optional[str] = None
+    friendlyName: Optional[str] = None
+    label: Optional[str] = None
 
     def get_element_id(self) -> str:
         return self.elementId or self.value or ""

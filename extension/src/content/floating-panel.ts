@@ -896,9 +896,11 @@ export function injectFloatingPanel(forceShow = false): void {
 
   function formatPill(pill?: string | { action: string; target?: string; confidence?: number }): string {
     if (!pill) return '';
-    if (typeof pill === 'string') return pill;
-    const conf = pill.confidence != null ? ` ${Math.round(pill.confidence * 100)}%` : '';
-    return `${pill.action.toUpperCase()} ${pill.target || ''}${conf}`.trim();
+    let str = typeof pill === 'string'
+      ? pill
+      : `${pill.action.toUpperCase()} ${pill.target || ''}${pill.confidence != null ? ` ${Math.round(pill.confidence * 100)}%` : ''}`.trim();
+    str = str.replace(/#?el_\d+/g, 'target');
+    return str;
   }
 
   // ── RENDER CHAT MESSAGE ─────────────────────────────────────────────────────
@@ -954,7 +956,7 @@ export function injectFloatingPanel(forceShow = false): void {
           <div class="confirm-title">
             <span>✋ User Confirmation Required</span>
           </div>
-          <div class="confirm-text">${escapeHtml(msg.text || 'Target button found. Shall I click it?')}</div>
+          <div class="confirm-text">${escapeHtml((msg.text || 'Target button found. Shall I click it?').replace(/#el_\d+/g, 'button'))}</div>
           ${pillText ? `<div class="action-pill" style="margin-bottom:8px;">${escapeHtml(pillText)}</div>` : ''}
           <div class="confirm-actions" id="actions-${actionId}">
             ${isAlreadyDecided
