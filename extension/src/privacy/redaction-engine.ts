@@ -161,24 +161,96 @@ export async function loadAndRedactScreenshot(
   });
 }
 
-/** Strip sensitive values from UIElements before server transmission */
+const PII_PATTERNS = [
+  { type: 'email' as const, regex: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/gi, token: '[EMAIL REDACTED]' },
+  { type: 'phone' as const, regex: /\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, token: '[PHONE REDACTED]' },
+  { type: 'credit_card' as const, regex: /\b(?:\d{4}[-\s]?){3}\d{4}\b/g, token: '[CARD REDACTED]' },
+  { type: 'auth_token' as const, regex: /\b(?:ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50,}|eyJh[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})\b/gi, token: '[AUTH_TOKEN REDACTED]' },
+];
+
+export function maskPIIString(str?: string, entities: PIIEntity[] = []): { text?: string; isSensitive: boolean; detectedType?: import('../utils/types').PIIType } {
+  if (!str) return { text: str, isSensitive: false };
+  let sanitized = redactText(str, entities);
+  let isSensitive = sanitized !== str;
+  let detectedType: import('../utils/types').PIIType | undefined = isSensitive ? 'email' : undefined;
+
+  for (const pattern of PII_PATTERNS) {
+    if (pattern.regex.test(sanitized)) {
+      isSensitive = true;
+      detectedType = pattern.type;
+      sanitized = sanitized.replace(pattern.regex, pattern.token);
+    }
+  }
+
+  // Also sanitize mailto: references
+  if (/mailto:/i.test(sanitized)) {
+    isSensitive = true;
+    detectedType = 'email';
+    sanitized = sanitized.replace(/mailto:[^\s"'>]+/gi, 'mailto:[EMAIL REDACTED]');
+  }
+
+  return { text: sanitized, isSensitive, detectedType };
+}
+
+/** Strip sensitive values and mask PII in element labels, attributes, and values before server transmission */
 export function sanitizeElements(elements: UIElement[], entities: PIIEntity[]): UIElement[] {
   const sensitiveSelectors = new Set(entities.map(e => e.domSelector).filter(Boolean));
   return elements.map(el => {
-    if (!el.sensitive && !sensitiveSelectors.has(el.domSelector)) return el;
     const entity = entities.find(e => e.domSelector === el.domSelector);
+    
+    // Mask label, ariaLabel, placeholder, and value
+    const maskLabel = maskPIIString(el.label, entities);
+    const maskAria = maskPIIString(el.ariaLabel, entities);
+    const maskPlaceholder = maskPIIString(el.placeholder, entities);
+    const cleanAttrs = sanitizeAttributes(el.attributes || {}, entities);
+
+    // Check if element is sensitive via DOM inspection, matched PII entity, or masked string
+    const isSensitive = Boolean(
+      el.sensitive ||
+      sensitiveSelectors.has(el.domSelector) ||
+      maskLabel.isSensitive ||
+      maskAria.isSensitive ||
+      maskPlaceholder.isSensitive ||
+      entity != null
+    );
+
+    const detectedType = el.sensitivityType || maskLabel.detectedType || maskAria.detectedType || entity?.type || 'email';
+
+    const finalLabel = maskLabel.text;
+    const finalAria = maskAria.text;
+    const finalPlaceholder = isSensitive
+      ? (entity?.placeholder ?? `[${detectedType.toUpperCase()} REDACTED]`)
+      : (maskPlaceholder.text || el.placeholder);
+
     return {
       ...el,
-      value: undefined,
-      attributes: sanitizeAttributes(el.attributes),
-      placeholder: entity?.placeholder ?? `[${el.type.toUpperCase()} REDACTED]`
+      label: finalLabel,
+      ariaLabel: finalAria,
+      sensitive: isSensitive,
+      sensitivityType: isSensitive ? detectedType : undefined,
+      value: isSensitive
+        ? (el.value ? `[${detectedType.toUpperCase()} REDACTED]` : undefined)
+        : el.value,
+      attributes: cleanAttrs,
+      placeholder: finalPlaceholder,
     };
   });
 }
 
-function sanitizeAttributes(attrs: Record<string, string>): Record<string, string> {
+function sanitizeAttributes(attrs: Record<string, string>, entities: PIIEntity[] = []): Record<string, string> {
   const SKIP = new Set(['value', 'data-value', 'data-token', 'data-key']);
-  return Object.fromEntries(Object.entries(attrs).filter(([k]) => !SKIP.has(k.toLowerCase())));
+  const result: Record<string, string> = {};
+  for (const [k, v] of Object.entries(attrs)) {
+    if (SKIP.has(k.toLowerCase())) continue;
+    let cleanVal = v;
+    if (/href/i.test(k) && /mailto:/i.test(cleanVal)) {
+      cleanVal = cleanVal.replace(/mailto:[^\s"'>]+/gi, 'mailto:[EMAIL REDACTED]');
+    } else {
+      cleanVal = maskPIIString(cleanVal, entities).text || cleanVal;
+    }
+    result[k] = cleanVal;
+  }
+  return result;
 }
 
 function boxBlur(srcData: Uint8ClampedArray, w: number, h: number, r: number): number[] {

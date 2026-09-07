@@ -97,6 +97,7 @@ export interface ActionResult {
   executedAt: number;
   latencyMs: number;
   isFileUploadTrigger?: boolean;
+  isDownloadTrigger?: boolean;
 }
 
 export interface PrivacySettings {
@@ -143,6 +144,7 @@ export interface SanitizedContext {
   pageTitle: string;
   pageType: string;
   timestamp: number;
+  rawElements?: UIElement[];
   elements: UIElement[];
   sanitizedText: string;
   ocrTexts: string[];
@@ -231,6 +233,7 @@ export type TraceEventType =
   | 'USER_CONFIRMATION'
   | 'ACTION_EXECUTED'
   | 'ACTION_VERIFIED'
+  | 'NAVIGATION'
   | 'TASK_COMPLETED'
   | 'ERROR';
 
@@ -287,7 +290,8 @@ export type TaskState =
   | 'ACTION_INVALID'
   | 'LOW_CONFIDENCE'
   | 'UNSUPPORTED_SITE'
-  | 'USER_REQUIRED';
+  | 'USER_REQUIRED'
+  | 'WAITING_USER';
 
 // ── SITE COMPATIBILITY ─────────────────────────────────────────────────────────
 

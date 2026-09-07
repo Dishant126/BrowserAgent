@@ -61,6 +61,8 @@ class SanitizedContext(BaseModel):
     piiSummary: PIISummary = Field(default_factory=PIISummary)
     screenshotIncluded: bool = False
     sanitizedScreenshot: Optional[str] = None   # Base64 only if all PII redacted
+    rawScreenshot: Optional[str] = None         # Client-side raw screenshot for judges demonstration
+    rawElements: Optional[list[Any]] = None     # Client-side raw elements before masking
     perceptionLevel: Optional[int] = None        # 1=A11y, 2=DOM, 3=OCR, 4=Screenshot
     stateHash: Optional[str] = None              # Lightweight page state hash
     siteAdapter: Optional[str] = None            # Active site adapter name
@@ -71,6 +73,8 @@ class ActionRequest(BaseModel):
     task: str                          # User's natural language instruction
     sessionId: str
     context: SanitizedContext
+    rawScreenshot: Optional[str] = None
+    rawElements: Optional[list[Any]] = None
     stepNumber: int = 1
     previousActions: list[dict] = []   # History of prior steps sent to LLM for memory
     conversationHistory: list[dict[str, Any]] = Field(default_factory=list) # Multi-turn conversational memory

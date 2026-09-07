@@ -54,9 +54,11 @@ export async function checkWebGPUSupport(): Promise<boolean> {
 export async function evaluateScreenState(
   canvas: HTMLCanvasElement,
   scrollX = 0,
-  scrollY = 0
+  scrollY = 0,
+  devicePixelRatio = 1
 ): Promise<ScreenEvaluation> {
   const t0 = performance.now();
+  const dpr = devicePixelRatio > 0 ? devicePixelRatio : (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
   const hasGPU = await checkWebGPUSupport();
   const backend = hasGPU ? 'WebGPU' : 'WASM';
 
@@ -92,12 +94,13 @@ export async function evaluateScreenState(
       const g = data[idx + 1];
       const b = data[idx + 2];
 
-      // Convert RGB to YCbCr
+      // Convert RGB to YCbCr & check luminance
+      const yLum = 0.299 * r + 0.587 * g + 0.114 * b;
       const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
       const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
 
-      // Human skin chrominance cluster: Cb in [77, 127], Cr in [133, 173]
-      if (cb >= 77 && cb <= 127 && cr >= 133 && cr <= 173 && r > g && g > b) {
+      // Human skin chrominance cluster (requires visible luminance, rejecting dark theme backgrounds)
+      if (yLum >= 60 && r >= 50 && cb >= 77 && cb <= 127 && cr >= 133 && cr <= 173 && r > g && g > b) {
         const gridIdx = Math.floor(y / step) * gridW + Math.floor(x / step);
         skinMap[gridIdx] = 1;
         totalSkinPixels++;
@@ -152,10 +155,9 @@ export async function evaluateScreenState(
         const boxH = pixelMaxY - pixelMinY;
         const aspectRatio = boxW / (boxH || 1);
 
-        // Typical human face aspect ratio: 0.65 to 1.3
-        if (count >= minClusterSize && boxW >= 32 && boxH >= 32 && aspectRatio >= 0.55 && aspectRatio <= 1.5) {
-          // Verify this is an actual human photo and NOT a generic grey silhouette or vector placeholder icon:
-          // In a default avatar silhouette, the center of the bounding box is a flat grey/monochrome bust on a colored circle.
+        // Face / portrait aspect ratio & dimension boundaries
+        if (count >= minClusterSize && boxW >= 28 && boxH >= 28 && boxW <= 350 && boxH <= 350 && aspectRatio >= 0.35 && aspectRatio <= 2.2) {
+          // Verify this is an actual human photo and NOT a generic flat silhouette or placeholder icon
           const cX1 = Math.floor(pixelMinX + boxW * 0.22);
           const cX2 = Math.floor(pixelMinX + boxW * 0.78);
           const cY1 = Math.floor(pixelMinY + boxH * 0.22);
@@ -163,7 +165,6 @@ export async function evaluateScreenState(
 
           let centerPixels = 0;
           let centerMonochromeOrFlat = 0;
-          let centerSkinPixels = 0;
 
           for (let py = cY1; py < cY2 && py < height; py += 3) {
             for (let px = cX1; px < cX2 && px < width; px += 3) {
@@ -173,33 +174,26 @@ export async function evaluateScreenState(
               const pb = data[pIdx + 2];
               centerPixels++;
 
-              // Check if pixel is neutral grey / monochrome (|R-G| < 12 and |G-B| < 12) or flat white/black
-              const isMonochrome = Math.max(Math.abs(pr - pg), Math.abs(pg - pb), Math.abs(pr - pb)) < 14;
-              if (isMonochrome || (pr > 240 && pg > 240 && pb > 240) || (pr < 30 && pg < 30 && pb < 30)) {
+              // Check if pixel is neutral grey / monochrome (|R-G| < 12 and |G-B| < 12) or pure white/black
+              const isMonochrome = Math.max(Math.abs(pr - pg), Math.abs(pg - pb), Math.abs(pr - pb)) < 12;
+              if (isMonochrome || (pr > 245 && pg > 245 && pb > 245) || (pr < 15 && pg < 15 && pb < 15)) {
                 centerMonochromeOrFlat++;
-              }
-
-              // Check skin tone in center
-              const pCb = 128 - 0.168736 * pr - 0.331264 * pg + 0.5 * pb;
-              const pCr = 128 + 0.5 * pr - 0.418688 * pg - 0.081312 * pb;
-              if (pCb >= 77 && pCb <= 127 && pCr >= 133 && pCr <= 173 && pr > pg && pg > pb) {
-                centerSkinPixels++;
               }
             }
           }
 
-          // If center is predominantly a neutral grey silhouette icon or lacks human skin in the core facial area, reject it!
-          const isSilhouetteIcon = centerPixels > 0 && (centerMonochromeOrFlat / centerPixels > 0.40 || centerSkinPixels / centerPixels < 0.12);
+          // If center is predominantly a neutral grey silhouette icon (>75% flat monochrome), reject it
+          const isSilhouetteIcon = centerPixels > 0 && (centerMonochromeOrFlat / centerPixels > 0.75);
           if (isSilhouetteIcon) {
             continue; // Skip generic placeholder silhouette / icon
           }
 
           detections.push({
             bbox: {
-              x: pixelMinX + scrollX,
-              y: pixelMinY + scrollY,
-              width: boxW,
-              height: boxH,
+              x: Math.round(pixelMinX / dpr + scrollX),
+              y: Math.round(pixelMinY / dpr + scrollY),
+              width: Math.round(boxW / dpr),
+              height: Math.round(boxH / dpr),
             },
             type: 'face',
             confidence: Math.min(0.96, 0.75 + (count / 150) * 0.2),

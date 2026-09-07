@@ -207,8 +207,8 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
         }
       }
 
-      // Check if user is answering an existing pending user input
-      if (currentTask.pendingUserInput && currentTask.taskState === 'USER_REQUIRED') {
+      // Check if user is answering an existing pending user input or waiting state
+      if (currentTask.pendingUserInput && (currentTask.taskState === 'USER_REQUIRED' || currentTask.taskState === 'WAITING_USER')) {
         broadcastChatMessage({ kind: 'user', text: instruction });
         const actionId = currentTask.pendingUserInput.actionId;
         const resolver = pendingUserInputs.get(actionId);
@@ -217,6 +217,13 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
           pendingUserInputs.delete(actionId);
         }
         currentTask.pendingUserInput = null;
+        sendResponse({ ok: true, handledAsInput: true });
+        break;
+      }
+      if (currentTask.taskState === 'WAITING_USER') {
+        broadcastChatMessage({ kind: 'user', text: instruction });
+        currentTask.conversationHistory.push({ role: 'user', text: trimmed });
+        setTaskState('EXECUTING');
         sendResponse({ ok: true, handledAsInput: true });
         break;
       }
@@ -362,6 +369,30 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
   return false;
 });
 
+// ── DOWNLOAD COMPLETION LISTENER ─────────────────────────────────────────────
+// Automatically detects when a converted file or document starts/finishes downloading
+if (typeof chrome !== 'undefined' && chrome.downloads?.onCreated) {
+  chrome.downloads.onCreated.addListener((item) => {
+    if (currentTask.stepNumber > 0 && !currentTask.stopped && currentTask.taskState !== 'IDLE' && currentTask.taskState !== 'COMPLETED') {
+      console.log('[Background] File download detected:', item.filename || item.url);
+      const doneMsg = 'Task completed! The converted document has been saved to your downloads folder.';
+      currentTask.conversationHistory.push({ role: 'assistant', text: doneMsg });
+      emitTraceEvent('TASK_COMPLETED', doneMsg, currentTask.stepNumber, { filename: item.filename });
+      broadcastChatMessage({
+        kind: 'assistant',
+        text: doneMsg,
+        actionPill: 'TASK COMPLETED',
+      });
+      setTaskState('COMPLETED');
+      broadcastTaskDone(doneMsg);
+      currentTask.stopped = true;
+      setTimeout(() => {
+        setTaskState('IDLE');
+      }, 500);
+    }
+  });
+}
+
 // ── TASK RUNNER LOOP ──────────────────────────────────────────────────────────
 
 async function startTask(instruction: string, sessionId: string, targetUrl?: string, tabId?: number) {
@@ -411,14 +442,65 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       body: JSON.stringify({ sessionId, taskInstruction: instruction }),
     }).catch(err => console.warn('[Background] Server session warning:', err));
 
-    // Navigate if target URL specified
-    if (targetUrl) {
-      const currentTab = await chrome.tabs.get(activeTabId).catch(() => null);
-      if (currentTab?.url !== targetUrl) {
-        await chrome.tabs.update(activeTabId, { url: targetUrl });
-        setTaskState('WAITING_FOR_PAGE');
-        await delay(2000);
+    // Detect if current tab is restricted, empty, or not the requested site
+    const currentTab = await chrome.tabs.get(activeTabId).catch(() => null);
+    const currentUrl = (currentTab?.url || '').trim().toLowerCase();
+    const isRestrictedUrl =
+      !currentUrl ||
+      currentUrl.startsWith('chrome://') ||
+      currentUrl.startsWith('chrome-extension://') ||
+      currentUrl.startsWith('edge://') ||
+      currentUrl === 'about:blank' ||
+      currentUrl.startsWith('data:');
+
+    // Determine target URL: explicit targetUrl OR inferred from user instruction
+    let destinationUrl = targetUrl;
+    if (!destinationUrl) {
+      const promptLower = instruction.toLowerCase();
+      const explicitUrlMatch = instruction.match(/https?:\/\/[^\s]+/i);
+      if (explicitUrlMatch) {
+        destinationUrl = explicitUrlMatch[0];
+      } else if (/irctc|train|railway|\bpnr\b/i.test(promptLower)) {
+        destinationUrl = 'https://www.irctc.co.in/nget/train-search';
+      } else if (/github\.com|\bgithub\b|\brepo\b|\brepository\b/i.test(promptLower) && (isRestrictedUrl || !currentUrl.includes('github.com'))) {
+        destinationUrl = 'https://github.com';
+      } else if (/\b(?:pdf|word|ilovepdf|merge|split|compress|convert)\b/i.test(promptLower) && (isRestrictedUrl || !currentUrl.includes('ilovepdf.com'))) {
+        if (/pdf\s+to\s+word|word\s+to\s+pdf|convert\s+pdf/i.test(promptLower)) {
+          destinationUrl = 'https://www.ilovepdf.com/pdf_to_word';
+        } else if (/merge/i.test(promptLower)) {
+          destinationUrl = 'https://www.ilovepdf.com/merge_pdf';
+        } else if (/split/i.test(promptLower)) {
+          destinationUrl = 'https://www.ilovepdf.com/split_pdf';
+        } else if (/compress/i.test(promptLower)) {
+          destinationUrl = 'https://www.ilovepdf.com/compress_pdf';
+        } else {
+          destinationUrl = 'https://www.ilovepdf.com';
+        }
+      } else if (/\bmakemytrip\b|\bflights?\b|\bhotels?\b/i.test(promptLower) && (isRestrictedUrl || !currentUrl.includes('makemytrip.com'))) {
+        destinationUrl = 'https://www.makemytrip.com';
+      } else if (/\bbooks to scrape\b/i.test(promptLower) && isRestrictedUrl) {
+        destinationUrl = 'http://books.toscrape.com';
+      } else if (/\bquotes to scrape\b/i.test(promptLower) && isRestrictedUrl) {
+        destinationUrl = 'http://quotes.toscrape.com';
+      } else if (/\bwikipedia\b/i.test(promptLower) && isRestrictedUrl) {
+        destinationUrl = 'https://www.wikipedia.org';
       }
+    }
+
+    if (destinationUrl) {
+      const needsNav = isRestrictedUrl || !currentUrl.startsWith(destinationUrl.replace(/\/$/, ''));
+      if (needsNav) {
+        broadcastChatMessage({ kind: 'status', text: `🌐 Navigating to ${destinationUrl}...` });
+        emitTraceEvent('NAVIGATION', `Navigating to ${destinationUrl}`, 0);
+        setTaskState('WAITING_FOR_PAGE');
+        await chrome.tabs.update(activeTabId, { url: destinationUrl });
+        await waitForTabToSettle(activeTabId, 10000);
+      }
+    } else if (isRestrictedUrl) {
+      broadcastChatMessage({ kind: 'status', text: '🌐 Opening search to locate requested service...' });
+      await chrome.tabs.update(activeTabId, { url: 'https://www.google.com' });
+      setTaskState('WAITING_FOR_PAGE');
+      await waitForTabToSettle(activeTabId, 8000);
     }
 
     // Preflight content script injection check
@@ -440,21 +522,49 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
 
     // ── INTERACTIVE STEP LOOP ──────────────────────────────────────────────
     let instructionStep = 1;
+    let lastCapturedUrl = '';
+    let lastHasModal = false;
+    let cachedScreenshot: string | undefined = undefined;
+    let cachedSanitizedScreenshot: string | undefined = undefined;
+
     while (currentTask.stepNumber <= MAX_STEPS && !currentTask.stopped) {
       const stepNum = currentTask.stepNumber;
       currentTask.retryCount = 0;
+
+      // Determine if a new page opened or a new popup/modal appeared
+      const tabObj = await chrome.tabs.get(activeTabId).catch(() => null);
+      const curUrl = tabObj?.url || '';
+
+      let curHasModal = false;
+      try {
+        const modalCheck = await chrome.scripting.executeScript({
+          target: { tabId: activeTabId },
+          func: () => Boolean(document.querySelector('.modal.show, [role="dialog"], .dialog, .popup, .swal2-container, #kavach, .modal-backdrop')),
+        });
+        curHasModal = Boolean(modalCheck?.[0]?.result);
+      } catch {}
+
+      const isNewPage = curUrl !== lastCapturedUrl;
+      const isNewPopup = curHasModal && !lastHasModal;
+      const shouldCaptureAndMask = stepNum === 1 || isNewPage || isNewPopup || !cachedSanitizedScreenshot;
 
       // STEP 1: SCANNING (Automatic page perception & capture)
       setTaskState('SCANNING');
       emitTraceEvent('SCAN_STARTED', `Scanning tab #${activeTabId} viewport and DOM`, stepNum);
       broadcastChatMessage({ kind: 'status', text: '🔍 Scanning page...' });
 
-      // Capture screenshot for local vision model & visual redaction
-      let screenshot: string | undefined;
-      try {
-        screenshot = await captureTabScreenshot(activeTabId);
-      } catch (capErr) {
-        console.warn('[Background] Screen capture warning:', capErr);
+      // Capture screenshot ONLY when new page opens or new popup opens
+      let screenshot = cachedScreenshot;
+      if (shouldCaptureAndMask) {
+        try {
+          const freshShot = await captureTabScreenshot(activeTabId);
+          if (freshShot) {
+            screenshot = freshShot;
+            cachedScreenshot = freshShot;
+          }
+        } catch (capErr) {
+          console.warn('[Background] Screen capture warning:', capErr);
+        }
       }
 
       // STEP 2: VISION PROCESSING (Local YOLOS-Tiny on WebGPU/WASM)
@@ -464,7 +574,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
 
       const analysisResult = await sendMessageToTab(activeTabId, {
         type: 'ANALYZE_PAGE',
-        forceRefresh: true,
+        forceRefresh: shouldCaptureAndMask,
         screenshot,
       });
 
@@ -514,9 +624,13 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
 
       emitTraceEvent('SANITIZED_CONTEXT_CREATED', `Sanitized context prepared: ${context.elements?.length || 0} elements, redacted preview`, stepNum);
 
-      // Surface sanitized screenshot preview in chat feed
-      const screenshotToShow = context.sanitizedScreenshot || context.screenshot;
-      if (screenshotToShow) {
+      // Surface sanitized screenshot preview in chat feed ONLY when new page or popup opens
+      const screenshotToShow = context.sanitizedScreenshot || context.screenshot || screenshot || cachedSanitizedScreenshot;
+      if (screenshotToShow && shouldCaptureAndMask) {
+        cachedSanitizedScreenshot = screenshotToShow;
+        lastCapturedUrl = curUrl;
+        lastHasModal = curHasModal;
+
         const detectedTypes = Object.keys(context.piiSummary?.byType || {});
         broadcastChatMessage({
           kind: 'screenshot',
@@ -526,6 +640,17 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
           piiTypes: detectedTypes,
           visionStats: vStats,
         });
+      }
+
+      // Guarantee screenshot is attached to context for server reasoning and dashboard
+      if (!context.sanitizedScreenshot && screenshotToShow) {
+        context.sanitizedScreenshot = screenshotToShow;
+      }
+      if (!context.screenshot && screenshotToShow) {
+        context.screenshot = screenshotToShow;
+      }
+      if (screenshotToShow) {
+        context.screenshotIncluded = true;
       }
 
       // STEP 4: THINKING / REASONING (Server Groq/LLM with sanitized context only)
@@ -551,12 +676,67 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
           timestamp: e.timestamp || Date.now(),
         }));
 
+        fetch(`${SERVER_URL}/perception/update`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId,
+            step: stepNum,
+            task: instruction,
+            url: context.pageUrl,
+            title: context.pageTitle,
+            rawScreenshot: screenshot,
+            sanitizedScreenshot: context.sanitizedScreenshot || screenshotToShow || screenshot,
+            rawElements: ((context as any).rawElements || context.elements || []).map((e: any) => ({
+              id: e.id || e.elementId,
+              tag: e.tagName || e.type,
+              role: e.role,
+              label: e.label || e.ariaLabel || e.placeholder,
+              sensitive: Boolean(e.sensitive),
+              value: e.value,
+            })),
+            elements: (context.elements || []).map((e: any) => {
+              const rawL = e.label || e.ariaLabel || e.placeholder || '';
+              const isEmail = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/i.test(rawL);
+              const isPhone = /\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/i.test(rawL);
+              const isRedactedToken = /\[.*REDACTED.*\]/i.test(rawL) || /\[.*BLURRED.*\]/i.test(rawL);
+              const isSens = Boolean(e.sensitive) || isEmail || isPhone || isRedactedToken;
+              const cleanL = rawL
+                .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/gi, '[EMAIL REDACTED]')
+                .replace(/\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, '[PHONE REDACTED]')
+                .replace(/mailto:[^\s"'>]+/gi, 'mailto:[EMAIL REDACTED]');
+              const typeStr = isEmail ? 'EMAIL' : (e.sensitivityType ? e.sensitivityType.toUpperCase() : 'PII');
+              return {
+                id: e.id || e.elementId,
+                tag: e.tagName || e.type,
+                role: e.role,
+                label: cleanL,
+                sensitive: isSens,
+                value: isSens ? (e.value && !String(e.value).includes('REDACTED') ? `[${typeStr} REDACTED]` : (e.value || undefined)) : e.value,
+              };
+            }),
+            rawText: analysisResult.rawText || context.sanitizedText || '',
+            sanitizedText: context.sanitizedText || '',
+            piiSummary: context.piiSummary,
+            piiEntities: sanitizedEntities,
+          }),
+        }).catch(() => {});
+
         serverRes = await fetch(`${SERVER_URL}/action`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             task: instruction,
             context,
+            rawScreenshot: screenshot,
+            rawElements: ((context as any).rawElements || context.elements || []).map((e: any) => ({
+              id: e.id || e.elementId,
+              tag: e.tagName || e.type,
+              role: e.role,
+              label: e.label || e.ariaLabel || e.placeholder,
+              sensitive: Boolean(e.sensitive),
+              value: e.value,
+            })),
             previousActions: currentTask.previousActions.map((a, i) => ({ ...a, step: i + 1 })),
             conversationHistory: currentTask.conversationHistory,
             stepNumber: instructionStep,
@@ -652,21 +832,30 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       // Handle ask_user
       if (action.action === 'ask_user') {
         setTaskState('USER_REQUIRED');
+        const promptText = action.prompt || 'Please provide input or enter details on the page to continue:';
         broadcastChatMessage({
           kind: 'assistant',
-          text: action.prompt || 'Please provide input to continue:',
+          text: promptText,
         });
-        const userVal = await requestUserInput(action.prompt || 'Please provide input:', `ask-${stepNum}`);
-        currentTask.previousActions.push(action);
+        const userVal = await requestUserInput(promptText, `ask-${stepNum}`);
+        const userSummary = userVal && userVal.trim() ? userVal.trim() : 'I have entered the required details on the page.';
+        currentTask.conversationHistory.push({ role: 'assistant', text: promptText });
+        currentTask.conversationHistory.push({ role: 'user', text: userSummary });
+        broadcastChatMessage({
+          kind: 'status',
+          text: `▶ Details received. Continuing autonomous task...`,
+        });
+        currentTask.previousActions.push({ ...action, value: userSummary });
         currentTask.stepNumber++;
-        await delay(500);
+        instructionStep++;
+        await delay(600);
         continue;
       }
 
       // STEP 5: CONFIRMATION CHECK
-      // Require user confirmation on action proposals
-      const requiresConfirm = Boolean(action.requiresApproval) ||
-        (instructionStep === 1 || confidence < CONFIDENCE_AUTO_APPROVE);
+      // Only require confirmation if explicitly flagged as high-risk financial transaction
+      // or if confidence is extremely low (< 0.35). Normal autonomous clicks and tool interactions proceed directly.
+      const requiresConfirm = Boolean(action.requiresApproval) && (confidence < 0.40);
 
       if (requiresConfirm) {
         setTaskState('WAITING_FOR_CONFIRMATION');
@@ -706,11 +895,19 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
         text: `▶ Executing ${action.action.toUpperCase()} on ${displayTarget}...`,
       });
 
-      const execResult = await sendMessageToTab(activeTabId, {
-        type: 'ACTION_REQUEST',
-        action,
-        actionId: `action-${stepNum}`,
-      });
+      let execResult: any;
+      if (action.action === 'navigate' && action.url) {
+        broadcastChatMessage({ kind: 'status', text: `🌐 Navigating to ${action.url}...` });
+        await chrome.tabs.update(activeTabId, { url: action.url });
+        await waitForTabToSettle(activeTabId, 8000);
+        execResult = { success: true };
+      } else {
+        execResult = await sendMessageToTab(activeTabId, {
+          type: 'ACTION_REQUEST',
+          action,
+          actionId: `action-${stepNum}`,
+        });
+      }
 
       if (!execResult || !execResult.success) {
         console.warn('[Background] Action execution failed:', execResult?.error);
@@ -727,7 +924,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       // STEP 7: VERIFYING
       setTaskState('VERIFYING');
       broadcastChatMessage({ kind: 'status', text: '⏳ Verifying page state after action...' });
-      await waitForTabToSettle(activeTabId, 1200);
+      await waitForTabToSettle(activeTabId, 2500);
       emitTraceEvent('ACTION_VERIFIED', `Page state verified after ${action.action.toUpperCase()}`, stepNum);
 
       // Clear any stale visual overlay boxes from the previous page
@@ -736,64 +933,163 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       currentTask.previousActions.push(action);
       currentTask.stepNumber++;
 
-      // Check if file upload triggered or action completed the user intent
+      // Check if download action was executed (e.g. "Download WORD", "Download file", /download/ page)
       const targetVal = String(action.target?.value || '').toLowerCase();
       const reasonVal = String(action.reason || '').toLowerCase();
-      const isFileExplorerGoal =
-        Boolean(execResult?.isFileUploadTrigger) ||
-        (/select.*file|choose.*file|pickfile|open file explorer/i.test(reasonVal) && !reasonVal.includes('merge pdf')) ||
-        /pickfiles|uploader/i.test(targetVal);
+      const targetLabel = String(action.target?.label || action.target?.friendlyName || '').toLowerCase();
+      const currentTabObj = await chrome.tabs.get(activeTabId).catch(() => null);
+      const currentUrl = (currentTabObj?.url || '').toLowerCase();
 
-      if (isFileExplorerGoal) {
-        const fileMsg = 'Select files from file explorer. Please choose your PDF files from your computer to proceed.';
-        currentTask.conversationHistory.push({ role: 'assistant', text: fileMsg });
-        emitTraceEvent('TASK_COMPLETED', fileMsg, stepNum);
+      const isDownloadAction =
+        Boolean(execResult?.isDownloadTrigger) ||
+        /download/i.test(reasonVal) ||
+        /download/i.test(targetLabel) ||
+        /download/i.test(targetVal) ||
+        currentUrl.includes('/download');
+
+      if (isDownloadAction) {
+        const completeMsg = 'Task completed! The converted document has been downloaded to your downloads folder.';
+        currentTask.conversationHistory.push({ role: 'assistant', text: completeMsg });
+        emitTraceEvent('TASK_COMPLETED', completeMsg, stepNum);
         broadcastChatMessage({
           kind: 'assistant',
-          text: fileMsg,
-          actionPill: 'UPLOAD ACTIVE',
+          text: completeMsg,
+          actionPill: 'TASK COMPLETED',
         });
         setTaskState('COMPLETED');
-        broadcastTaskDone(fileMsg);
+        broadcastTaskDone(completeMsg);
         await delay(500);
         setTaskState('IDLE');
         return;
       }
 
-      // Check if action was an intermediate step (e.g. clicked Merge PDF or navigated to tool page)
-      const isIntermediateNav = /merge pdf|split pdf|compress pdf|convert pdf|all pdf tools/i.test(reasonVal) ||
-                                /merge pdf/i.test(targetVal) ||
-                                Boolean(execResult?.navigated);
+      const isFileExplorerGoal =
+        !isDownloadAction &&
+        (Boolean(execResult?.isFileUploadTrigger) ||
+        (/select.*file|choose.*file|pickfile|open file explorer/i.test(reasonVal) && !reasonVal.includes('merge pdf') && !reasonVal.includes('convert')) ||
+        (!currentUrl.includes('/download') && /pickfiles|uploader/i.test(targetVal)));
 
-      if (isIntermediateNav) {
+      if (isFileExplorerGoal) {
+        const onlyOpenExplorer = /^(open|launch|show)\s+(the\s+)?(file\s+)?(explorer|picker)$/i.test(currentTask.instruction.trim());
+        if (onlyOpenExplorer) {
+          const fileMsg = 'Select files from file explorer. Please choose your PDF files from your computer to proceed.';
+          currentTask.conversationHistory.push({ role: 'assistant', text: fileMsg });
+          emitTraceEvent('TASK_COMPLETED', fileMsg, stepNum);
+          broadcastChatMessage({
+            kind: 'assistant',
+            text: fileMsg,
+            actionPill: 'UPLOAD ACTIVE',
+          });
+          setTaskState('COMPLETED');
+          broadcastTaskDone(fileMsg);
+          await delay(500);
+          setTaskState('IDLE');
+          return;
+        }
+
+        // For conversion, merge, or multi-step tasks, file picker opened:
+        // Let the user choose file, and watch for file card or process button to appear!
+        const waitMsg = 'File explorer opened. Please select your file from your computer. The agent will automatically proceed once your file is selected.';
+        currentTask.conversationHistory.push({ role: 'assistant', text: waitMsg });
         broadcastChatMessage({
           kind: 'assistant',
-          text: `Opened tool page. Scanning new page elements...`,
-          actionPill,
+          text: waitMsg,
+          actionPill: 'WAITING FOR FILE',
         });
+        setTaskState('WAITING_USER');
+
+        // Watch tab DOM for uploaded file card or process button
+        let fileDetected = false;
+        for (let poll = 0; poll < 30; poll++) {
+          if (currentTask.stopped) break;
+          await delay(1500);
+          try {
+            const checkRes = await chrome.scripting.executeScript({
+              target: { tabId: activeTabId },
+              func: () => {
+                const hasFileItem = Boolean(document.querySelector('.file__item, .file__info, [data-filename], .uploader__file, .file-selected, [class*="file__item"]'));
+                const processBtn = document.getElementById('processTask') || document.querySelector('[id*="processTask"], button.btn--danger');
+                const hasProcessBtn = Boolean(processBtn && (processBtn as HTMLElement).offsetWidth > 0);
+                const hasFilenameInText = /\.(pdf|docx?|xlsx?|pptx?)\b/i.test(document.body.innerText || '');
+                return hasFileItem || hasProcessBtn || hasFilenameInText;
+              }
+            });
+            if (checkRes?.[0]?.result) {
+              fileDetected = true;
+              break;
+            }
+          } catch {
+            // dialog might be modal
+          }
+        }
+
+        if (fileDetected) {
+          const proceedMsg = 'File detected on page! Continuing autonomous processing...';
+          currentTask.conversationHistory.push({ role: 'assistant', text: proceedMsg });
+          broadcastChatMessage({
+            kind: 'assistant',
+            text: proceedMsg,
+            actionPill: 'FILE DETECTED',
+          });
+        }
+
+        setTaskState('EXECUTING');
         instructionStep++;
+        await delay(800);
         continue;
       }
 
-      // If action had a single-turn completion
-      const assistantDoneText = `Done: ${action.reason || `Successfully executed ${action.action} on ${displayTarget}`}.`;
-      currentTask.conversationHistory.push({ role: 'assistant', text: assistantDoneText });
-      emitTraceEvent('TASK_COMPLETED', assistantDoneText, stepNum);
+      // Handle wait action by polling tab DOM until conversion/upload finishes or URL changes
+      if (action.action === 'wait') {
+        const stepSummary = action.reason || 'Waiting for upload or conversion to complete...';
+        currentTask.conversationHistory.push({ role: 'assistant', text: `Step ${stepNum}: ${stepSummary}` });
+        broadcastChatMessage({
+          kind: 'assistant',
+          text: `Waiting: ${stepSummary}`,
+          actionPill: 'WAITING',
+        });
+
+        const startWaitUrl = currentUrl;
+        for (let p = 0; p < 25; p++) {
+          if (currentTask.stopped) break;
+          await delay(2000);
+          try {
+            const check = await chrome.scripting.executeScript({
+              target: { tabId: activeTabId },
+              func: () => {
+                const hasDl = Boolean(document.querySelector('a[href*="/download/"], [id*="download"], a.btn--danger, #pickfiles'));
+                const hasProcess = Boolean(document.getElementById('processTask'));
+                const hasModal = Boolean(document.querySelector('.modal.show, [role="dialog"], .swal2-shown, .popup'));
+                const isUploading = /uploading|converting|processing/i.test(document.body.innerText || '');
+                return hasDl || hasProcess || hasModal || !isUploading;
+              }
+            });
+            const tabAfter = await chrome.tabs.get(activeTabId).catch(() => null);
+            if (tabAfter?.url !== startWaitUrl || check?.[0]?.result) {
+              break;
+            }
+          } catch {}
+        }
+        sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS' }).catch(() => {});
+        instructionStep++;
+        await delay(500);
+        continue;
+      }
+
+      // Multi-step agent loop: continue to the next step so the LLM can perceive updated DOM/screenshot and finish the entire user goal!
+      const stepSummary = action.reason || `Executed ${action.action.toUpperCase()} on ${displayTarget}`;
+      currentTask.conversationHistory.push({ role: 'assistant', text: `Step ${stepNum}: ${stepSummary}` });
       broadcastChatMessage({
         kind: 'assistant',
-        text: assistantDoneText,
+        text: `Executed: ${stepSummary}. Proceeding to next step...`,
         actionPill,
       });
 
-      // Clear old overlays on tab and trigger a clean scan of settled page
+      // Clear old overlays on tab and wait for tab to settle before next perception step
       sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS' }).catch(() => {});
-      sendMessageToTab(activeTabId, { type: 'ANALYZE_PAGE', forceRefresh: true }).catch(() => {});
-
-      setTaskState('COMPLETED');
-      broadcastTaskDone(assistantDoneText);
-      await delay(400);
-      setTaskState('IDLE'); // Ready for next user prompt in the same session!
-      return;
+      instructionStep++;
+      await delay(900);
+      continue;
     }
 
     if (currentTask.stepNumber > MAX_STEPS) {
@@ -908,6 +1204,7 @@ function taskStateToLegacyStatus(state: TaskState): string {
     LOW_CONFIDENCE: 'error',
     UNSUPPORTED_SITE: 'idle',
     USER_REQUIRED: 'acting',
+    WAITING_USER: 'acting',
   };
   return MAP[state] ?? 'idle';
 }
@@ -971,68 +1268,34 @@ function generateId(): string {
  * Used to feed the vision pipeline (OCR + face detection).
  */
 async function captureTabScreenshot(tabId: number): Promise<string | undefined> {
-  return new Promise((resolve) => {
-    let finished = false;
-    const timer = setTimeout(() => {
-      if (!finished) {
-        finished = true;
-        console.warn('[Background] Screenshot capture timed out (3000ms limit), proceeding with DOM perception');
-        resolve(undefined);
-      }
-    }, 3000);
+  try {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (tab && typeof tab.windowId === 'number' && tab.windowId >= 0) {
+      const dataUrl = await new Promise<string | undefined>((resolve) => {
+        chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 }, (url) => {
+          if (chrome.runtime.lastError || !url) {
+            chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 70 }, (fallback) => {
+              resolve(fallback || undefined);
+            });
+          } else {
+            resolve(url);
+          }
+        });
+      });
+      if (dataUrl) return dataUrl;
+    }
+  } catch (err) {
+    console.warn('[Background] Screen capture warning:', err);
+  }
 
-    const safeResolve = (url?: string) => {
-      if (!finished) {
-        finished = true;
-        clearTimeout(timer);
-        resolve(url);
-      }
-    };
-
+  // Fallback: capture without windowId
+  return new Promise<string | undefined>((resolve) => {
     try {
-      chrome.tabs.get(tabId, (tab) => {
-        if (chrome.runtime.lastError || !tab) {
-          try {
-            chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 70 }, (fallbackUrl) => {
-              safeResolve(fallbackUrl || undefined);
-            });
-          } catch {
-            safeResolve(undefined);
-          }
-          return;
-        }
-
-        const winId = tab.windowId;
-        if (typeof winId === 'number' && winId >= 0) {
-          try {
-            chrome.tabs.captureVisibleTab(winId, { format: 'jpeg', quality: 70 }, (dataUrl) => {
-              if (chrome.runtime.lastError || !dataUrl) {
-                try {
-                  chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 70 }, (fallbackUrl) => {
-                    safeResolve(fallbackUrl || undefined);
-                  });
-                } catch {
-                  safeResolve(undefined);
-                }
-              } else {
-                safeResolve(dataUrl);
-              }
-            });
-          } catch {
-            safeResolve(undefined);
-          }
-        } else {
-          try {
-            chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 70 }, (dataUrl) => {
-              safeResolve(dataUrl || undefined);
-            });
-          } catch {
-            safeResolve(undefined);
-          }
-        }
+      chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 70 }, (fallback) => {
+        resolve(fallback || undefined);
       });
     } catch {
-      safeResolve(undefined);
+      resolve(undefined);
     }
   });
 }

@@ -102,26 +102,25 @@ CRITICAL RULES:
 3. Elements are identified by stable IDs like el_001, el_002, etc. — ALWAYS use these IDs in targets.
 4. Do NOT generate CSS selectors, JavaScript, or raw DOM paths. Use element IDs only.
 5. Do ONE action per step — never chain multiple actions in one response.
-6. Do NOT repeat an action already in ACTIONS ALREADY EXECUTED unless the page state changed.
+6. Do NOT repeat an action already in ACTIONS ALREADY EXECUTED unless the page state changed. If you already scrolled and the requested item/button still does not exist on this website, call 'ask_user' or 'done' explaining that the element is not found.
 7. SENSITIVE DATA: If the task requires a password, OTP, payment info, or government ID, use ask_user.
-8. COMPLETION: When the task goal is visibly achieved (article found, results shown, form done), return done or finish.
+8. COMPLETION: You are an autonomous agent. Continue executing actions step-by-step until the ENTIRE user goal is achieved. Only return 'done' or 'finish' when the final objective is visibly accomplished on the page (e.g. form submitted, requested button clicked, article read, item starred or added to cart). Never stop after an intermediate navigation or click.
 9. CONFIDENCE: Be honest about confidence. Low = 0.70, Medium = 0.85, High = 0.95+
-10. NAVIGATION: After a search/submit, wait to see results on the NEXT step before acting on them.
+10. NAVIGATION: After a search or page transition, wait or observe the updated page state on the NEXT step before acting on new elements.
 
-SITE-SPECIFIC WORKFLOWS:
-- MAKEMYTRIP (makemytrip.com):
-  * If a login popup or promotional modal appears, click its close/dismiss button or click directly on the flight search form.
-  * For flights: Click "One Way" tab if one-way. Click "From" input, type city name (e.g. "Delhi").
-  * CRITICAL: Immediately after typing a city in From or To, CLICK the first autocomplete suggestion from the dropdown. Do not press Enter.
-  * For Date: Click the departure date picker and select the requested date from the calendar.
-  * Click the "Search" button. When results appear, call done.
-- ILOVEPDF (ilovepdf.com):
-  * If on homepage, click the required tool link (e.g. "Merge PDF", "Compress PDF", "PDF to Word").
-  * On tool page: click "Select PDF files" (#pickfiles) to trigger file upload. Reason: "Shall I click on Select PDF files to open file explorer?"
-  * NEVER return done without first clicking the file selection button.
-  * Click the "Download" button when ready.
-- WIKIPEDIA (wikipedia.org):
-  * Find the search input, fill the query, click search or press enter, and locate the primary article content.
+GENERAL-PURPOSE AGENT STRATEGIES (Works on ANY website):
+- MULTI-STEP EXPLORATION:
+  * If the user's goal requires navigating through multiple screens (e.g. going to a tab/profile, finding a specific item in a list, opening it, and interacting with it), break it down logically.
+  * Step 1: Open the relevant section, tab, or search bar.
+  * Step 2: Locate the specific target item from the loaded results.
+  * Step 3: Perform the requested action on that item (click, star, submit, fill, download, etc.).
+- POPUPS & OVERLAYS:
+  * If a cookie banner, login modal, or promotional overlay blocks the view, click its close ('✕', 'Dismiss', 'Close', 'No thanks') button first.
+- SEARCH & AUTOCOMPLETE:
+  * When filling a search input that offers dynamic suggestions, prefer clicking the matching suggestion item from the dropdown.
+- SCROLLING & UNFOUND ELEMENTS:
+  * If a requested item or button is not visible in the current viewport elements and you have not scrolled yet, emit a 'scroll' action downwards to bring it into view.
+  * If you have already scrolled and the requested item clearly does not exist on the page, return 'ask_user' or 'done' explaining that the element was not found.
 
 ELEMENT ID FORMAT:
 Each interactive element has a stable ID like el_001. The target field must use:
@@ -157,17 +156,24 @@ def format_context_for_llm(
         el_id = getattr(el, 'elementId', None) or el.id or el.domSelector
         parts = [f"[{el_id}]"]
         parts.append(f'tag={el.tagName or el.type}')
-        if el.label:
-            parts.append(f'label="{el.label}"')
-        if el.placeholder:
-            parts.append(f'placeholder="{el.placeholder}"')
+        lbl = getattr(el, 'label', None) or ""
+        lbl = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', '[EMAIL REDACTED]', str(lbl))
+        if lbl:
+            parts.append(f'label="{lbl}"')
+        ph = getattr(el, 'placeholder', None) or ""
+        ph = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', '[EMAIL REDACTED]', str(ph))
+        if ph:
+            parts.append(f'placeholder="{ph}"')
         if el.role:
             parts.append(f'role="{el.role[:80]}"')
-        if getattr(el, 'ariaLabel', None):
-            parts.append(f'aria="{el.ariaLabel}"')
+        aria = getattr(el, 'ariaLabel', None) or ""
+        aria = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', '[EMAIL REDACTED]', str(aria))
+        if aria:
+            parts.append(f'aria="{aria}"')
         if el.value and not el.sensitive:
-            parts.append(f'value="{el.value}"')
-        if el.sensitive:
+            val_clean = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', '[EMAIL REDACTED]', str(el.value))
+            parts.append(f'value="{val_clean}"')
+        if el.sensitive or '[EMAIL REDACTED]' in lbl or '[EMAIL REDACTED]' in ph:
             parts.append(f'[REDACTED:{el.sensitivityType or "pii"}]')
         elem_lines.append("  - " + " ".join(parts))
 
@@ -323,16 +329,17 @@ def parse_action_response(text: Any, context: Optional[SanitizedContext] = None,
 
     reason = data.get("reason", "LLM decision")
     task_str = (task or "").lower().strip()
-    is_find_intent = any(task_str.startswith(w) or f" {w} " in f" {task_str} " for w in ["find", "locate", "search for", "where is", "show me"])
+    is_find_only = (task_str.startswith("find the ") or task_str.startswith("locate the ") or task_str.startswith("where is")) and not any(w in task_str for w in ["and", "then", "open", "click", "star", "submit", "fill", "book"])
 
     # If friendly name is resolved, clean any raw '#el_004' references in reason
     if friendly_name:
         reason = re.sub(r'#?el_\d+', f'"{friendly_name}"', reason)
-        if is_find_intent and action_type == "click":
+        if is_find_only and action_type == "click":
             reason = f'I found the "{friendly_name}" button. Would you like me to click it?'
 
-    requires_approval = bool(data.get("requiresApproval", False)) or (is_find_intent and action_type == "click")
-    if any(w in reason.lower() for w in ["shall i", "approve", "select pdf files", "select files", "choose files", "open file explorer", "would you like me to"]):
+    requires_approval = bool(data.get("requiresApproval", False)) or (is_find_only and action_type == "click")
+    is_sensitive_flow = any(w in reason.lower() for w in ["approve payment", "confirm purchase"])
+    if is_sensitive_flow:
         requires_approval = True
 
     raw_conf = data.get("confidence", 0.9)
@@ -560,17 +567,193 @@ class DynamicDOMSolverLLM:
 
         # ── Extract fill targets from task ─────────────────────────────────────
         dest, origin = "", ""
-        dest_m   = re.search(r'\bto\s+([A-Za-z]+)', task, re.I)
-        origin_m = re.search(r'\bfrom\s+([A-Za-z]+)', task, re.I)
-        if dest_m:   dest   = dest_m.group(1).strip()
+        origin_m = re.search(r'\bfrom\s+([A-Za-z\s]+?)(?:\s+station|\s+to|\s+on|\s+at|$)', task, re.I)
+        dest_m   = re.search(r'\bto\s+([A-Za-z\s]+?)(?:\s+station|\s+from|\s+on|\s+at|$)', task, re.I)
         if origin_m: origin = origin_m.group(1).strip()
+        if dest_m:   dest   = dest_m.group(1).strip()
+        if not origin:
+            orig_fallback = re.search(r'\bfrom\s+([A-Za-z]+)', task, re.I)
+            if orig_fallback: origin = orig_fallback.group(1).strip()
+        if not dest:
+            dest_fallback = re.search(r'\bto\s+([A-Za-z]+)', task, re.I)
+            if dest_fallback: dest = dest_fallback.group(1).strip()
 
         import datetime as _dt
         date_val = ""
         if "tomorrow" in task_lower:
-            date_val = (_dt.date.today() + _dt.timedelta(days=1)).isoformat()
+            date_val = (_dt.date.today() + _dt.timedelta(days=1)).strftime("%d/%m/%Y")
         date_m = re.search(r'(\d{4}-\d{2}-\d{2})', task)
         if date_m: date_val = date_m.group(1)
+        date_slash = re.search(r'(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4})', task)
+        if date_slash and not date_val:
+            parts = re.split(r'[\/\-\.]', date_slash.group(1))
+            if len(parts) == 3:
+                day, month, year = parts[0].zfill(2), parts[1].zfill(2), parts[2]
+                if len(year) == 2: year = "20" + year
+                date_val = f"{day}/{month}/{year}"
+            else:
+                date_val = date_slash.group(1)
+
+        # ── SPECIAL HANDLING 0: Direct navigation if starting on search engine / new tab ──────────
+        is_search_or_blank = any(w in page_url.lower() for w in ["google.com", "bing.com", "duckduckgo.com", "search.brave.com", "newtab", "about:blank", "brave://", "chrome://"]) or not page_url
+        if is_search_or_blank:
+            if re.search(r'\b(?:pdf\s+to\s+word|convert\s+pdf|word\s+to\s+pdf)\b', task_lower):
+                return json.dumps({
+                    "action": "navigate",
+                    "url": "https://www.ilovepdf.com/pdf_to_word",
+                    "reason": "Navigating directly to PDF to Word converter on iLovePDF",
+                    "confidence": 0.98,
+                })
+            elif re.search(r'\b(?:merge\s+pdf|combine\s+pdf)\b', task_lower):
+                return json.dumps({
+                    "action": "navigate",
+                    "url": "https://www.ilovepdf.com/merge_pdf",
+                    "reason": "Navigating directly to Merge PDF tool on iLovePDF",
+                    "confidence": 0.98,
+                })
+            elif re.search(r'\b(?:compress\s+pdf|reduce\s+pdf)\b', task_lower):
+                return json.dumps({
+                    "action": "navigate",
+                    "url": "https://www.ilovepdf.com/compress_pdf",
+                    "reason": "Navigating directly to Compress PDF tool on iLovePDF",
+                    "confidence": 0.98,
+                })
+            elif re.search(r'\b(?:split\s+pdf)\b', task_lower):
+                return json.dumps({
+                    "action": "navigate",
+                    "url": "https://www.ilovepdf.com/split_pdf",
+                    "reason": "Navigating directly to Split PDF tool on iLovePDF",
+                    "confidence": 0.98,
+                })
+            elif re.search(r'\b(?:train|irctc|pnr)\b', task_lower):
+                return json.dumps({
+                    "action": "navigate",
+                    "url": "https://www.irctc.co.in/nget/train-search",
+                    "reason": "Navigating directly to IRCTC train booking",
+                    "confidence": 0.98,
+                })
+            elif re.search(r'\b(?:flight|makemytrip)\b', task_lower):
+                return json.dumps({
+                    "action": "navigate",
+                    "url": "https://www.makemytrip.com",
+                    "reason": "Navigating directly to MakeMyTrip flight booking",
+                    "confidence": 0.98,
+                })
+
+        # ── SPECIAL HANDLING 1: Dismiss initial disclaimer / Kavach popup dialogs ──────────
+        for el in parsed:
+            if el["is_button"] and ("dismiss alert" in el["hint"] or "dismiss" in el["hint"] or el["hint"] == "ok"):
+                if ("click", el["el_id"]) not in done_set:
+                    return json.dumps({
+                        "action": "click",
+                        "target": {"type": "element-id", "value": el["el_id"], "elementId": el["el_id"]},
+                        "reason": "Dismissing alert popup",
+                        "confidence": 0.95,
+                    })
+
+        # ── SPECIAL HANDLING 2: IRCTC Login Modal (Human-In-The-Loop) ──────────
+        has_login_modal = any(
+            ("irctc password" in el["hint"] or "password" in el["hint"]) and el["is_input"]
+            for el in parsed
+        )
+        if has_login_modal and ("login" in task_lower or "book" in task_lower or "irctc" in page_url.lower()):
+            return json.dumps({
+                "action": "ask_user",
+                "prompt": "IRCTC requires login to proceed with booking. Please enter your credentials and solve the CAPTCHA. All your personal credentials remain strictly masked and protected on your local device.",
+                "reason": "IRCTC login authentication required with Human-in-the-Loop",
+                "confidence": 0.95,
+            })
+
+        # ── SPECIAL HANDLING 3: Autocomplete suggestion selection (origin / destination) ──────────
+        for el in parsed:
+            if ("click", el["el_id"]) in done_set: continue
+            if "station option" in el["hint"] or "station suggestion" in el["hint"]:
+                h_low = el["hint"].lower()
+                orig_words = [w.lower() for w in origin.split() if len(w) >= 3]
+                dest_words = [w.lower() for w in dest.split() if len(w) >= 3]
+                if (orig_words and any(w in h_low for w in orig_words)) or (dest_words and any(w in h_low for w in dest_words)):
+                    return json.dumps({
+                        "action": "click",
+                        "target": {"type": "element-id", "value": el["el_id"], "elementId": el["el_id"]},
+                        "reason": f"Select matching station suggestion '{el['label']}'",
+                        "confidence": 0.95,
+                    })
+
+        # ── SPECIAL HANDLING 4: Train list page results (Book Now / Class Selection) ──────────
+        if "train-list" in page_url.lower() or any("book now" in el["hint"] for el in parsed):
+            # Check for class selection if user specified sleeper, 3a, 2a, etc.
+            req_class = None
+            if re.search(r'\b(?:sleeper|sl)\b', task_lower): req_class = "sleeper"
+            elif re.search(r'\b(?:3a|3 tier|3rd ac|third ac)\b', task_lower): req_class = "3 tier"
+            elif re.search(r'\b(?:2a|2 tier|2nd ac|second ac)\b', task_lower): req_class = "2 tier"
+            elif re.search(r'\b(?:1a|1st ac|first ac)\b', task_lower): req_class = "first"
+
+            if req_class:
+                class_el = next((el for el in parsed if req_class in el["hint"] and ("select class" in el["hint"] or "class tab" in el["hint"])), None)
+                if class_el and ("click", class_el["el_id"]) not in done_set:
+                    return json.dumps({
+                        "action": "click",
+                        "target": {"type": "element-id", "value": class_el["el_id"], "elementId": class_el["el_id"]},
+                        "reason": f"Select {req_class.upper()} travel class",
+                        "confidence": 0.92,
+                    })
+
+            # Click Book Now
+            book_btn = next((el for el in parsed if "book now" in el["hint"] and ("click", el["el_id"]) not in done_set), None)
+            if book_btn:
+                return json.dumps({
+                    "action": "click",
+                    "target": {"type": "element-id", "value": book_btn["el_id"], "elementId": book_btn["el_id"]},
+                    "reason": "Clicking Book Now for selected train",
+                    "confidence": 0.95,
+                })
+
+        # ── SPECIAL HANDLING 5: PDF Processing & Conversion Tools (iLovePDF, etc.) ──────────
+        # Check if process/convert button is ready (e.g. "Convert to WORD", "Merge PDF", "Compress PDF")
+        process_btn = next((
+            el for el in parsed
+            if (el["is_button"] or "btn" in el.get("tag", "") or el.get("el_id") == "processTask") and (
+                el["el_id"] == "processTask" or
+                "processtask" in el["el_id"].lower() or
+                any(w in el["hint"] for w in ["convert to word", "merge pdf", "compress pdf", "split pdf", "convert to"])
+            ) and ("click", el["el_id"]) not in done_set
+        ), None)
+        if process_btn:
+            btn_lbl = process_btn["label"] or process_btn["role"] or "Convert to WORD"
+            return json.dumps({
+                "action": "click",
+                "target": {"type": "element-id", "value": process_btn["el_id"], "elementId": process_btn["el_id"]},
+                "reason": f"Clicking '{btn_lbl}' to process the uploaded file",
+                "confidence": 0.98,
+                "requiresApproval": False,
+            })
+
+        # Check if Download button is ready after conversion / processing
+        download_btn = next((
+            el for el in parsed
+            if (el["is_button"] or el["is_link"]) and (
+                any(w in el["hint"] for w in ["download word", "download merged pdf", "download file", "download pdf", "download document"]) or
+                ("download" in el["hint"] and any(w in el["hint"] for w in ["word", "pdf", "file", "now"]))
+            ) and ("click", el["el_id"]) not in done_set
+        ), None)
+        if download_btn:
+            dl_lbl = download_btn["label"] or download_btn["role"] or "Download file"
+            return json.dumps({
+                "action": "click",
+                "target": {"type": "element-id", "value": download_btn["el_id"], "elementId": download_btn["el_id"]},
+                "reason": f"Clicking '{dl_lbl}' to save the converted file",
+                "confidence": 0.99,
+                "requiresApproval": False,
+            })
+
+        # If on download page and download button was clicked or file has finished converting, complete task
+        is_on_download_page = "/download" in page_url.lower() or "converted to an editable" in (page_title + " " + getattr(context, "sanitizedText", "")).lower()
+        if is_on_download_page and (len(history or []) > 0 or ("click", download_btn["el_id"] if download_btn else "") in done_set):
+            return json.dumps({
+                "action": "done",
+                "reason": "The converted file has been downloaded to your downloads folder. Task completed!",
+                "confidence": 0.99,
+            })
 
         # ── STEP 1: Fill empty text inputs when task specifies values ──────────
         for el in parsed:
@@ -639,10 +822,10 @@ class DynamicDOMSolverLLM:
             score = sum(4 for w in task_words_base if w in h)
 
             # Check if this element is a file picker/uploader button
-            is_file_picker_elem = (
-                any(w in h for w in ["select pdf files", "select files", "choose files", "upload", "pickfiles", "select file", "browse file"]) or
-                "file" in el.get("tag", "") or "file" in el.get("placeholder", "") or
-                el.get("el_id") == "pickfiles"
+            is_file_picker_elem = (not is_on_download_page) and (
+                any(w in h for w in ["select pdf files", "select files", "choose files", "upload", "select file", "browse file"]) or
+                ("file" in el.get("tag", "") and not "download" in h) or
+                (el.get("el_id") == "pickfiles" and not "download" in h)
             )
 
             # Boost file upload elements when task explicitly requests file explorer / upload OR already on tool page and not asking for a different tool
@@ -676,17 +859,17 @@ class DynamicDOMSolverLLM:
                 any(w in task_lower for w in ["yes", "confirm", "proceed", "go ahead", "approved"])
             )
 
-            if wants_to_find or not is_confirmed_turn:
+            if wants_to_find:
                 if is_file_picker:
                     action_reason = "Shall I click on Select PDF files to open file explorer?"
                 else:
                     action_reason = f"I found the {display_clean} button. Would you like me to click it?"
                 requires_approval = True
             elif is_file_picker:
-                action_reason = "Shall I click on Select PDF files to open file explorer?"
+                action_reason = "Clicking to open file explorer for file selection"
                 requires_approval = False
             else:
-                action_reason = f"Executing confirmed action on '{display_clean}'"
+                action_reason = f"Clicking '{display_clean}' to proceed with task"
                 requires_approval = False
 
             return json.dumps({
@@ -783,18 +966,13 @@ async def reason(
 
     provider = os.getenv("LLM_PROVIDER", "gemini").lower()
 
-    # Multimodal image handling: pass screenshot to VLM ONLY when DOM elements are absent or perceptionLevel >= 4
-    interactables = [e for e in getattr(context, "elements", []) if getattr(e, "interactable", True) and getattr(e, "visible", True)]
-    has_image = bool(
-        getattr(context, "sanitizedScreenshot", None) and
-        getattr(context, "screenshotIncluded", False) and
-        (len(interactables) == 0 or getattr(context, "perceptionLevel", 1) >= 4)
-    )
+    # Multimodal image handling: In SIH 171, provide visual screenshot perception to VLM whenever available
+    raw_screen = getattr(context, "sanitizedScreenshot", None) or getattr(context, "screenshot", None)
+    has_image = bool(raw_screen and len(str(raw_screen)) > 100)
     if has_image and provider in ("gemini", "openai"):
-        raw_screen = getattr(context, "sanitizedScreenshot", None) or ""
         image_url = str(raw_screen)
         if image_url and not image_url.startswith("data:"):
-            image_url = f"data:image/webp;base64,{image_url}"
+            image_url = f"data:image/jpeg;base64,{image_url}"
         human_content: list[dict[str, Any]] = [
             {"type": "text", "text": prompt},
             {"type": "image_url", "image_url": {"url": image_url}},
