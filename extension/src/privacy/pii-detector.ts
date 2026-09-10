@@ -82,8 +82,8 @@ const PATTERNS: Array<{ type: PIIType; pattern: RegExp; confidence: number }> = 
   { type: 'phone',       pattern: /\+?1?\s?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b/g,                              confidence: 0.85 },
   // Credit card (16-digit, with spaces or dashes)
   { type: 'credit_card', pattern: /\b(?:\d[ \-]?){13,15}\d\b/g,                                                   confidence: 0.90 },
-  // Aadhaar (12 digits, optionally grouped by 4)
-  { type: 'aadhaar',     pattern: /\b\d{4}[\s]?\d{4}[\s]?\d{4}\b/g,                                               confidence: 0.88 },
+  // Aadhaar (12 digits, starting with 2-9, separated by spaces or dashes)
+  { type: 'aadhaar',     pattern: /\b[2-9]\d{3}[\s-]\d{4}[\s-]\d{4}\b/g,                                          confidence: 0.92 },
   // PAN Card
   { type: 'pan',         pattern: /\b[A-Z]{5}[0-9]{4}[A-Z]\b/g,                                                   confidence: 0.97 },
   // UPI ID (handles without TLD, e.g. user@oksbi, user@paytm)
@@ -266,7 +266,8 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
 export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
   const entities: PIIEntity[] = [];
   const enabledTypes = new Set(settings.enabledCategories);
-  const NAME_LABEL_REGEX = /(?:First\s*name|Given\s*name|Last\s*name|Surname|Full\s*name|User\s*name|Profile\s*name|Passenger|Registered|Hi|Hello|Welcome|Hey|Dear)\s*[,:\-]?\s*([A-Za-z\u00C0-\u024F]{2,30}(?:\s+[A-Za-z\u00C0-\u024F]{2,30})*)/i;
+  const NAME_LABEL_REGEX = /(?:(?:[Ff]irst|[Gg]iven|[Ll]ast|[Ff]ull|[Uu]ser|[Pp]rofile)\s*name\s*[:\-]|(?:[Hh]i|[Hh]ello|[Hh]ey|[Dd]ear)\s*[\uD800-\uDBFF\uDC00-\uDFFF\u2600-\u27BF\s,:\-]*I['’]m)\s+([A-Z][a-z]{1,25}(?:\s+[A-Z][a-z]{1,25}){1,3})\b/;
+  const FORBIDDEN_WORDS = /\b(country|india|united\s*states|timezone|utc|email|phone|password|address|city|state|zip|postal|change|edit|update|delete|cancel|save|profile|account|select|choose|none|optional|required|sign|login|logout|menu|tools|developer|engineer|software|designer|manager|student|founder|stack|problem|solver|enthusiast|creator|architect|specialist|passionate|contributor|member|overview|repositories|projects|packages|stars)\b/i;
 
   try {
     const walker = document.createTreeWalker(
@@ -339,12 +340,13 @@ export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
         }
       }
 
-      // 2. Contextual inline name detection (e.g. "First name: Dharaya", "Registered Dharaya")
+      // 2. Contextual inline name detection (e.g. "First name: Dharaya", "Hi, I'm Krishna Agarwal")
       if (enabledTypes.has('name')) {
         const nameMatch = NAME_LABEL_REGEX.exec(text);
         if (nameMatch && nameMatch[1]) {
           const nameValue = nameMatch[1];
-          const nameIndex = text.indexOf(nameValue, nameMatch.index);
+          if (!FORBIDDEN_WORDS.test(nameValue)) {
+            const nameIndex = text.indexOf(nameValue, nameMatch.index);
           if (nameIndex !== -1) {
             try {
               const range = document.createRange();
@@ -378,16 +380,16 @@ export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
           }
         }
       }
+    }
 
       currentNode = walker.nextNode();
     }
 
-    // 3. Scan profile name containers and labels (e.g. "First name: Dharaya", "Registered Dharaya")
+    // 3. Scan profile name containers and labels (e.g. "First name: Dharaya")
     if (enabledTypes.has('name')) {
-      const NAME_CONTAINER_REGEX = /(?:First\s*name|Given\s*name|Full\s*name|Registered|Hi|Hello|Welcome|Hey|Dear|Account|User)\s*[,:\-]?\s*([A-Za-z\u00C0-\u024F]{2,30}(?:\s+[A-Za-z\u00C0-\u024F]{2,30})*)/i;
-      const FORBIDDEN_WORDS = /\b(country|india|united\s*states|timezone|utc|email|phone|password|address|city|state|zip|postal|change|edit|update|delete|cancel|save|profile|account|select|choose|none|optional|required|sign|login|logout|menu|tools)\b/i;
+      const NAME_CONTAINER_REGEX = /(?:(?:[Ff]irst|[Gg]iven|[Ff]ull|[Rr]egistered|[Uu]ser|[Pp]rofile)\s*name\s*[:\-]|(?:[Hh]i|[Hh]ello|[Hh]ey|[Dd]ear)\s*[\uD800-\uDBFF\uDC00-\uDFFF\u2600-\u27BF\s,:\-]*I['’]m)\s+([A-Z][a-z]{1,25}(?:\s+[A-Z][a-z]{1,25}){1,3})\b/;
 
-      const candidateElements = document.querySelectorAll<HTMLElement>('label, div, p, span, h1, h2, h3, h4, h5, h6, dt, dd, li');
+      const candidateElements = document.querySelectorAll<HTMLElement>('label, dt, h1, h2, [class*="author"], [class*="profile-name"], [class*="user-name"], [class*="vcard-names"]');
       candidateElements.forEach(el => {
         if (el.children.length > 25) return;
         const text = (el.innerText || '').trim();
@@ -518,6 +520,46 @@ export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
                   timestamp: Date.now(),
                 });
               }
+            }
+          }
+        }
+      });
+
+      // 5. Scan semantic profile name elements (e.g. GitHub [itemprop="name"], .p-name, .vcard-fullname, profile headers)
+      const profileNameElements = document.querySelectorAll<HTMLElement>(
+        '[itemprop="name"], .p-name, .vcard-fullname, .profile-name, [class*="profile-fullname"], [class*="user-fullname"], .vcard-names span:first-child'
+      );
+      profileNameElements.forEach(pEl => {
+        const textVal = (pEl.innerText || '').trim();
+        if (textVal.length >= 2 && textVal.length <= 40 && !FORBIDDEN_WORDS.test(textVal)) {
+          const rect = pEl.getBoundingClientRect();
+          if (rect.width > 2 && rect.height > 2) {
+            const bbox: BoundingBox = {
+              x: Math.round(rect.left + window.scrollX),
+              y: Math.round(rect.top + window.scrollY),
+              width: Math.round(rect.width),
+              height: Math.round(rect.height),
+            };
+            const exists = entities.some(e =>
+              e.type === 'name' && e.bbox &&
+              Math.abs(e.bbox.x - bbox.x) < 15 && Math.abs(e.bbox.y - bbox.y) < 15
+            );
+            if (!exists) {
+              entities.push({
+                id: nextId(),
+                type: 'name',
+                confidence: 0.98,
+                source: 'dom',
+                sensitivity: 'MEDIUM',
+                redactionMethod: 'replace',
+                bbox,
+                targetElement: pEl,
+                isFixed: isElementFixedOrSticky(pEl),
+                domSelector: getSelector(pEl),
+                rawValue: textVal,
+                placeholder: PLACEHOLDER_MAP['name'],
+                timestamp: Date.now(),
+              });
             }
           }
         }

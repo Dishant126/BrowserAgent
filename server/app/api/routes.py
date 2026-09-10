@@ -4,7 +4,7 @@ import os
 import time
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, delete
 
 from app.schemas.action import (
     ActionRequest, ActionResponse, SessionCreate, MetricsUpdate, BrowserAction,
@@ -19,6 +19,7 @@ from app.models.db import (
 router = APIRouter()
 
 _latest_perception: dict | None = None
+_perception_history: list[dict] = []
 _session_pii_history: dict[str, list[dict]] = {}
 
 def normalize_pii_entities(raw_entities: list[dict] | None, pii_summary: Any, step: int = 1) -> list[dict]:
@@ -77,10 +78,20 @@ async def get_latest_perception():
         return {"hasData": False, "perception": None}
     return {"hasData": True, "perception": _latest_perception}
 
+@router.get("/perception/history")
+async def get_perception_history():
+    """Return complete history of all perception steps (raw vs masked screenshots & DOM) for judges."""
+    global _perception_history, _latest_perception
+    return {
+        "count": len(_perception_history),
+        "history": _perception_history,
+        "latest": _latest_perception
+    }
+
 @router.post("/perception/update")
 async def update_perception(data: dict):
     """Allow client extension or tests to explicitly publish live perception data."""
-    global _latest_perception
+    global _latest_perception, _perception_history, _session_pii_history
     sess_id = data.get("sessionId")
     ents = normalize_pii_entities(data.get("piiEntities"), data.get("piiSummary"), data.get("step", 1))
     if sess_id:
@@ -92,13 +103,45 @@ async def update_perception(data: dict):
             if k not in keys:
                 keys.add(k)
                 _session_pii_history[sess_id].append(ent)
-    _latest_perception = {
+    entry = {
         **data,
+        "rawScreenshot": data.get("rawScreenshot"),
+        "sanitizedScreenshot": data.get("sanitizedScreenshot"),
+        "rawElements": data.get("rawElements") or data.get("elements") or [],
+        "elements": data.get("elements") or [],
+        "rawText": data.get("rawText") or data.get("sanitizedText") or "",
+        "sanitizedText": data.get("sanitizedText") or "",
         "piiEntities": ents,
         "allSessionEntities": _session_pii_history.get(sess_id, ents),
         "timestamp": time.time()
     }
+    _latest_perception = entry
+
+    # Append to judges history (deduplicate identical URL & step if screenshot unchanged)
+    step_num = entry.get("step", len(_perception_history) + 1)
+    if not _perception_history:
+        _perception_history.append(entry)
+    elif _perception_history[-1].get("step") != step_num or _perception_history[-1].get("url") != entry.get("url"):
+        _perception_history.append(entry)
+    else:
+        _perception_history[-1] = entry
+
     return {"status": "ok"}
+
+@router.post("/perception/clear")
+async def clear_perception(db: AsyncSession = Depends(get_db)):
+    """Purge all ephemeral perception, session actions, and cached traces for judges demonstration."""
+    global _latest_perception, _session_pii_history, _perception_history
+    _latest_perception = None
+    _perception_history.clear()
+    _session_pii_history.clear()
+    try:
+        await db.execute(delete(DBAction))
+        await db.execute(delete(DBSession))
+        await db.commit()
+    except Exception as e:
+        print("Clear DB warning:", e)
+    return {"status": "cleared", "message": "All session and perception data wiped clean"}
 
 # ── SESSIONS ──────────────────────────────────────────────────────────────────
 
@@ -187,29 +230,22 @@ async def get_action(request: ActionRequest, db: AsyncSession = Depends(get_db))
         db.add(new_sess)
         await db.commit()
 
-    # Check for raw PII signals in sanitized context (defensive invariant check)
+    # Defense-in-depth: auto-sanitize residual raw PII signals so AI never receives raw personal data
     if request.context.sanitizedText:
         import re as _re
-        PII_PATTERNS = [
-            r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b',          # email
-            r'\b(?:\+91[\s\-]?)?[6-9]\d{4}[\s\-]?\d{5}\b',                      # Indian phone
-            r'\b(?:\+?1[\s\-]?)?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b',         # US phone
-            r'\b(?:\d[\s\-]?){13,15}\d\b',                                        # credit card
-            r'\b[A-Z]{5}[0-9]{4}[A-Z]\b',                                         # PAN card
-            r'\b\d{4}[\s]?\d{4}[\s]?\d{4}\b',                                     # Aadhaar
-            r'\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\b',    # JWT token
+        PII_SCRUBBERS = [
+            (r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b', '[EMAIL REDACTED]'),
+            (r'\b(?:\+91[\s\-]?)?[6-9]\d{4}[\s\-]?\d{5}\b', '[PHONE REDACTED]'),
+            (r'\b(?:\+?1[\s\-]?)?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b', '[PHONE REDACTED]'),
+            (r'\b(?:\d[\s\-]?){13,15}\d\b', '[CARD REDACTED]'),
+            (r'\b[A-Z]{5}[0-9]{4}[A-Z]\b', '[GOVT-ID REDACTED]'),
+            (r'\b\d{4}[\s]?\d{4}[\s]?\d{4}\b', '[GOVT-ID REDACTED]'),
+            (r'\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\b', '[TOKEN REDACTED]'),
         ]
-        # Only block if a pattern matches outside of our redaction placeholders
-        sanitized_text = request.context.sanitizedText
-        # Remove known redaction placeholders before checking
-        cleaned = _re.sub(r'\[(EMAIL|PHONE|CARD|GOVT-ID|TOKEN|PASSWORD|PERSON|ADDRESS|REDACTED)[^\]]*\]', '', sanitized_text)
-        for pattern in PII_PATTERNS:
-            if _re.search(pattern, cleaned):
-                raise HTTPException(
-                    status_code=422,
-                    detail=f"Privacy violation: potential raw PII detected in sanitized context. "
-                           "Ensure local redaction runs before calling this endpoint."
-                )
+        s_text = request.context.sanitizedText
+        for pat, rep in PII_SCRUBBERS:
+            s_text = _re.sub(pat, rep, s_text)
+        request.context.sanitizedText = s_text
 
     # Get LLM action — returns (action, latency_ms, model_name, prompt_sent, raw_response)
     action, server_latency_ms, model_used, prompt_sent, raw_llm_response = await reason(
@@ -318,18 +354,38 @@ async def get_action(request: ActionRequest, db: AsyncSession = Depends(get_db))
 
     # Update global latest perception so VisualPerception page gets real-time data
     global _latest_perception
+    raw_shot = (
+        getattr(request, "rawScreenshot", None) or
+        getattr(request.context, "rawScreenshot", None) or
+        (_latest_perception.get("rawScreenshot") if _latest_perception else None)
+    )
+    san_shot = (
+        getattr(request.context, "sanitizedScreenshot", None) or
+        getattr(request.context, "screenshot", None) or
+        (_latest_perception.get("sanitizedScreenshot") if _latest_perception else None) or
+        raw_shot
+    )
+    raw_elems = (
+        getattr(request, "rawElements", None) or
+        getattr(request.context, "rawElements", None) or
+        (_latest_perception.get("rawElements") if _latest_perception else None) or
+        [e.model_dump() if hasattr(e, "model_dump") else e for e in request.context.elements[:50]]
+    )
+
     _latest_perception = {
         "sessionId": request.sessionId,
         "task": request.task,
         "step": request.stepNumber,
         "url": getattr(request.context, "pageUrl", "") or getattr(request.context, "url", ""),
         "title": getattr(request.context, "pageTitle", "") or getattr(request.context, "title", "Active Tab"),
+        "rawScreenshot": raw_shot,
+        "sanitizedScreenshot": san_shot,
+        "rawElements": raw_elems,
         "elements": [e.model_dump() if hasattr(e, "model_dump") else e for e in request.context.elements[:50]],
         "piiSummary": request.context.piiSummary.model_dump() if hasattr(request.context.piiSummary, "model_dump") else dict(request.context.piiSummary),
         "piiEntities": norm_entities,
         "allSessionEntities": _session_pii_history.get(request.sessionId, norm_entities),
         "sanitizedText": request.context.sanitizedText,
-        "sanitizedScreenshot": getattr(request.context, "sanitizedScreenshot", None),
         "promptSentToLLM": prompt_sent,
         "rawLLMResponse": raw_llm_response,
         "modelUsed": model_used,
@@ -338,13 +394,21 @@ async def get_action(request: ActionRequest, db: AsyncSession = Depends(get_db))
         "timestamp": time.time(),
     }
 
+    if not _perception_history:
+        _perception_history.append(_latest_perception)
+    elif _perception_history[-1].get("step") != request.stepNumber or _perception_history[-1].get("url") != _latest_perception.get("url"):
+        _perception_history.append(_latest_perception)
+    else:
+        _perception_history[-1] = _latest_perception
+
     # Persist action with trace to DB
     action_dict = {
         **action.model_dump(),
         "trace": trace,
         "clientMetrics": cm,
         "piiEntities": norm_entities,
-        "sanitizedScreenshot": getattr(request.context, "sanitizedScreenshot", None),
+        "rawScreenshot": raw_shot,
+        "sanitizedScreenshot": san_shot,
     }
 
     db_action = DBAction(

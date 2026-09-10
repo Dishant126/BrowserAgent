@@ -239,9 +239,41 @@ export function applyRedactionsToCanvas(
     return (order[a.sensitivity] ?? 4) - (order[b.sensitivity] ?? 4);
   });
 
+  // Consolidate overlapping boxes of the same type into a single bounding box (e.g. face fragments)
+  const mergedEntities: PIIEntity[] = [];
+  for (const ent of sorted) {
+    if (!ent.bbox) continue;
+    const existing = mergedEntities.find(m => {
+      if (m.type !== ent.type || !m.bbox || !ent.bbox) return false;
+      const x1 = Math.max(m.bbox.x, ent.bbox.x);
+      const y1 = Math.max(m.bbox.y, ent.bbox.y);
+      const x2 = Math.min(m.bbox.x + m.bbox.width, ent.bbox.x + ent.bbox.width);
+      const y2 = Math.min(m.bbox.y + m.bbox.height, ent.bbox.y + ent.bbox.height);
+      if (x2 <= x1 || y2 <= y1) return false;
+      const interArea = (x2 - x1) * (y2 - y1);
+      const minArea = Math.min(m.bbox.width * m.bbox.height, ent.bbox.width * ent.bbox.height);
+      return minArea > 0 && interArea / minArea > 0.15;
+    });
+    if (existing && existing.bbox) {
+      const minX = Math.min(existing.bbox.x, ent.bbox.x);
+      const minY = Math.min(existing.bbox.y, ent.bbox.y);
+      const maxX = Math.max(existing.bbox.x + existing.bbox.width, ent.bbox.x + ent.bbox.width);
+      const maxY = Math.max(existing.bbox.y + existing.bbox.height, ent.bbox.y + ent.bbox.height);
+      existing.bbox = {
+        x: minX,
+        y: minY,
+        width: maxX - minX,
+        height: maxY - minY,
+      };
+      existing.confidence = Math.max(existing.confidence, ent.confidence);
+    } else {
+      mergedEntities.push({ ...ent, bbox: { ...ent.bbox } });
+    }
+  }
+
   let count = 0;
 
-  for (const entity of sorted) {
+  for (const entity of mergedEntities) {
     if (!entity.bbox) continue;
 
     // Convert CSS-pixel page coordinates → physical screenshot pixel coordinates
@@ -261,7 +293,8 @@ export function applyRedactionsToCanvas(
     const cy = Math.max(0, vpY);
     const cw = Math.min(vpW, canvas.width - cx);
     const ch = Math.min(vpH, canvas.height - cy);
-    if (cw <= 0 || ch <= 0) continue;
+    // Reject anomalous bounding boxes that would wipe out the entire screenshot
+    if (cw <= 0 || ch <= 0 || (cw > canvas.width * 0.6 && ch > canvas.height * 0.6)) continue;
 
     const clampedBbox: BoundingBox = { x: cx, y: cy, width: cw, height: ch };
     const colors = COLORS[entity.sensitivity] ?? COLORS.MEDIUM;

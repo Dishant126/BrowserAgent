@@ -846,12 +846,22 @@ export function injectFloatingPanel(forceShow = false): void {
   const visionBackendVal = shadow.getElementById('vision-backend-val')!;
 
   let isTaskRunning = false;
+  let currentTaskState = 'IDLE';
 
-  function setRunningState(running: boolean) {
-    isTaskRunning = running;
-    promptInput.disabled = running;
-    btnSend.style.display = running ? 'none' : 'flex';
-    btnStopLive.style.display = running ? 'flex' : 'none';
+  function setRunningState(running: boolean, state?: string) {
+    if (state) currentTaskState = state;
+    const isAwaitingInput = currentTaskState === 'USER_REQUIRED' || currentTaskState === 'WAITING_USER';
+    isTaskRunning = running && !isAwaitingInput;
+    promptInput.disabled = running && !isAwaitingInput;
+    btnSend.style.display = (running && !isAwaitingInput) ? 'none' : 'flex';
+    btnStopLive.style.display = (running && !isAwaitingInput) ? 'flex' : 'none';
+    if (currentTaskState === 'USER_REQUIRED') {
+      promptInput.placeholder = 'Enter required details or answer here...';
+    } else if (currentTaskState === 'WAITING_USER') {
+      promptInput.placeholder = 'Select file in browser or type instruction...';
+    } else {
+      promptInput.placeholder = 'Type instruction… (e.g. Find Merge PDF)';
+    }
   }
 
   function setStatus(text: string, color: string) {
@@ -864,9 +874,10 @@ export function injectFloatingPanel(forceShow = false): void {
   // ── SEND INSTRUCTION ────────────────────────────────────────────────────────
   function sendInstruction() {
     const text = promptInput.value.trim();
-    if (!text || isTaskRunning) return;
+    const isAwaitingInput = currentTaskState === 'USER_REQUIRED' || currentTaskState === 'WAITING_USER';
+    if (!text || (isTaskRunning && !isAwaitingInput)) return;
     promptInput.value = '';
-    setRunningState(true);
+    setRunningState(true, 'SCANNING');
     setStatus('🔍 Scanning…', '#22d3ee');
 
     chrome.runtime.sendMessage({
@@ -874,7 +885,7 @@ export function injectFloatingPanel(forceShow = false): void {
       instruction: text,
     }, (res) => {
       if (!res?.ok) {
-        setRunningState(false);
+        setRunningState(false, 'IDLE');
         setStatus('● Ready', '#10b981');
       }
     });
@@ -1092,6 +1103,8 @@ export function injectFloatingPanel(forceShow = false): void {
     VERIFYING:                 { label: '⏳ Verifying…', color: '#94a3b8', running: true },
     COMPLETED:                 { label: '✅ Done', color: '#10b981', running: false },
     ERROR:                     { label: '⚠ Error', color: '#ef4444', running: false },
+    USER_REQUIRED:             { label: '👤 Input Needed', color: '#f59e0b', running: false },
+    WAITING_USER:              { label: '⏳ Waiting File', color: '#f59e0b', running: false },
     // Legacy fallback
     UNDERSTANDING:             { label: '🧠 Understanding…', color: '#a78bfa', running: true },
     PERCEIVING:                { label: '👁 Perceiving…', color: '#22d3ee', running: true },
@@ -1117,7 +1130,7 @@ export function injectFloatingPanel(forceShow = false): void {
     }
     const info = STATE_INFO[res.taskState] ?? STATE_INFO.IDLE;
     setStatus(info.label, info.color);
-    setRunningState(info.running);
+    setRunningState(info.running, res.taskState);
   });
 
   // ── MESSAGE LISTENER ────────────────────────────────────────────────────────
@@ -1144,7 +1157,7 @@ export function injectFloatingPanel(forceShow = false): void {
       const state = msg.taskState ?? 'IDLE';
       const info = STATE_INFO[state] ?? { label: state, color: '#64748b', running: true };
       setStatus(info.label, info.color);
-      setRunningState(info.running);
+      setRunningState(info.running, state);
     }
 
     if (msg.type === 'STEP_UPDATE') {

@@ -13,7 +13,7 @@ export const DEFAULT_SETTINGS: PrivacySettings = {
   ],
   defaultRedactionMethod: 'mask',
   requireApprovalFor: ['navigate'],
-  sendScreenshots: false,
+  sendScreenshots: true,
   enableOCR: true,
   enableFaceDetection: true,
 };

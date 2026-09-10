@@ -50,10 +50,6 @@ export type YOLOSBackend = 'WebGPU' | 'WASM' | 'unavailable';
 const PII_LABEL_MAP: Record<string, { piiType: PIIType; sensitivity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW'; method: 'blur' | 'mask' | 'remove' | 'replace' }> = {
   'person':      { piiType: 'face',        sensitivity: 'HIGH',     method: 'blur' },
   'credit card': { piiType: 'credit_card', sensitivity: 'CRITICAL', method: 'mask' },
-  'cell phone':  { piiType: 'face',        sensitivity: 'MEDIUM',   method: 'blur' },
-  'book':        { piiType: 'face',        sensitivity: 'LOW',      method: 'blur' },
-  'laptop':      { piiType: 'face',        sensitivity: 'LOW',      method: 'blur' },
-  'tv':          { piiType: 'face',        sensitivity: 'LOW',      method: 'blur' },
 };
 
 // ── MODEL STATE ───────────────────────────────────────────────────────────────
@@ -166,9 +162,11 @@ export async function runYOLOSDetection(
   canvas: HTMLCanvasElement,
   scrollX = 0,
   scrollY = 0,
-  scoreThreshold = 0.50
+  scoreThreshold = 0.70,
+  devicePixelRatio = 1
 ): Promise<YOLOSDetectionResult> {
   const t0 = performance.now();
+  const dpr = devicePixelRatio > 0 ? devicePixelRatio : (typeof window !== 'undefined' ? window.devicePixelRatio || 1 : 1);
   const results: PIIEntity[] = [];
   const detectedLabels: string[] = [];
 
@@ -176,9 +174,9 @@ export async function runYOLOSDetection(
     const pipe = await Promise.race([
       getPipeline(),
       new Promise<null>((resolve) => setTimeout(() => {
-        console.warn('[YOLOS] Pipeline initialization timed out (1500ms limit)');
+        console.warn('[YOLOS] Pipeline initialization timed out (25000ms limit on cold start)');
         resolve(null);
-      }, 1500)),
+      }, 25000)),
     ]);
 
     if (!pipe) {
@@ -198,7 +196,7 @@ export async function runYOLOSDetection(
 
     const detections: YOLOSDetection[] = await Promise.race([
       pipe(imageDataUrl, { threshold: scoreThreshold }),
-      new Promise<YOLOSDetection[]>((resolve) => setTimeout(() => resolve([]), 1500)),
+      new Promise<YOLOSDetection[]>((resolve) => setTimeout(() => resolve([]), 6000)),
     ]);
 
     const latencyMs = Math.round(performance.now() - t0);
@@ -211,14 +209,27 @@ export async function runYOLOSDetection(
 
       const { xmin, ymin, xmax, ymax } = det.box;
       const bbox: BoundingBox = {
-        x:      Math.round(xmin + scrollX),
-        y:      Math.round(ymin + scrollY),
-        width:  Math.round(xmax - xmin),
-        height: Math.round(ymax - ymin),
+        x:      Math.round(xmin / dpr + scrollX),
+        y:      Math.round(ymin / dpr + scrollY),
+        width:  Math.round((xmax - xmin) / dpr),
+        height: Math.round((ymax - ymin) / dpr),
       };
 
-      // Skip tiny boxes — likely noise
-      if (bbox.width < 16 || bbox.height < 16) continue;
+      // Skip tiny boxes or oversized layout spans
+      if (bbox.width < 24 || bbox.height < 24 || bbox.width > 400 || bbox.height > 400) continue;
+
+      // Ensure detection lies on a real visual element (img or canvas), not empty HTML background
+      const centerX = bbox.x - scrollX + bbox.width / 2;
+      const centerY = bbox.y - scrollY + bbox.height / 2;
+      if (centerX >= 0 && centerX <= window.innerWidth && centerY >= 0 && centerY <= window.innerHeight) {
+        const el = document.elementFromPoint(centerX, centerY);
+        if (el) {
+          const isImageOrCanvas = el instanceof HTMLImageElement || el instanceof HTMLCanvasElement || !!el.closest('img, canvas, [class*="avatar"]');
+          if (!isImageOrCanvas && mapping.piiType === 'face') {
+            continue; // Skip phantom person detections in empty background / text
+          }
+        }
+      }
 
       const entity: PIIEntity = {
         id:              `yolos-${label.replace(/\s/g, '_')}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,

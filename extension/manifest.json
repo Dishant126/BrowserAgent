@@ -15,7 +15,8 @@
     "tabs",
     "offscreen",
     "alarms",
-    "sidePanel"
+    "sidePanel",
+    "downloads"
   ],
   "host_permissions": [
     "http://localhost/*",

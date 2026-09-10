@@ -159,6 +159,7 @@ function highlightInteraction(el: HTMLElement, type: string) {
 export async function executeAction(action: BrowserAction): Promise<ActionResult> {
   const startTime = Date.now();
   let isFileUpload = false;
+  let isDownload = false;
 
   try {
     switch (action.action) {
@@ -170,13 +171,28 @@ export async function executeAction(action: BrowserAction): Promise<ActionResult
         highlightInteraction(el, 'click');
         await delay(300);
 
-        // Check if element triggers native file explorer / picker
+        // Check if element is a download trigger
+        const isDownloadBtn =
+          /download/i.test(el.textContent || '') ||
+          /download/i.test(el.getAttribute('aria-label') || '') ||
+          /download/i.test(el.id || '') ||
+          /download/i.test(el.className || '') ||
+          (el as HTMLAnchorElement).hasAttribute?.('download') ||
+          window.location.pathname.includes('/download');
+
+        if (isDownloadBtn) {
+          isDownload = true;
+        }
+
+        // Check if element triggers native file explorer / picker (only when not on download page)
         const isFileUploadTrigger =
-          (el.tagName === 'INPUT' && (el as HTMLInputElement).type === 'file') ||
-          el.id === 'pickfiles' ||
-          el.classList.contains('uploader__btn') ||
-          /file|upload|choose|browse/i.test(el.textContent || '') ||
-          /file|upload|choose|browse/i.test(el.getAttribute('aria-label') || '');
+          !isDownloadBtn && (
+            (el.tagName === 'INPUT' && (el as HTMLInputElement).type === 'file') ||
+            (el.id === 'pickfiles' && !window.location.pathname.includes('/download')) ||
+            el.classList.contains('uploader__btn') ||
+            /upload|choose\s+file|browse\s+file|select\s+file/i.test(el.textContent || '') ||
+            /upload|choose\s+file|browse\s+file|select\s+file/i.test(el.getAttribute('aria-label') || '')
+          );
 
         if (isFileUploadTrigger) {
           isFileUpload = true;
@@ -212,12 +228,26 @@ export async function executeAction(action: BrowserAction): Promise<ActionResult
           // Show on-page interactive user-activation toast in case browser security requires direct tab gesture
           showFileSelectionNotification(el, fileInputs);
         } else {
-          // Dispatch full event sequence for standard interactive elements
+          // Dispatch full event sequence for standard interactive elements (including download buttons)
           el.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
           el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
           el.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
           el.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+          el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: window }));
           el.click();
+
+          // Anchor navigation fallback for tabs and links (e.g. GitHub Repositories tab)
+          const anchor = (el.tagName === 'A' ? el : el.closest('a')) as HTMLAnchorElement | null;
+          if (anchor && anchor.href && !anchor.href.startsWith('javascript:') && !anchor.href.startsWith('#')) {
+            const targetUrl = anchor.href;
+            const currentUrl = window.location.href;
+            setTimeout(() => {
+              if (window.location.href === currentUrl && window.location.href !== targetUrl) {
+                console.log('[ActionValidator] SPA/Anchor navigation fallback to:', targetUrl);
+                window.location.href = targetUrl;
+              }
+            }, 300);
+          }
         }
         break;
       }
@@ -314,6 +344,7 @@ export async function executeAction(action: BrowserAction): Promise<ActionResult
       executedAt: Date.now(),
       latencyMs: Date.now() - startTime,
       isFileUploadTrigger: isFileUpload,
+      isDownloadTrigger: isDownload,
     };
   } catch (err) {
     return {
@@ -323,6 +354,7 @@ export async function executeAction(action: BrowserAction): Promise<ActionResult
       executedAt: Date.now(),
       latencyMs: Date.now() - startTime,
       isFileUploadTrigger: isFileUpload,
+      isDownloadTrigger: isDownload,
     };
   }
 }

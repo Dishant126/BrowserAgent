@@ -50,6 +50,7 @@ const TASK_STATE_LABELS: Record<TaskState, string> = {
   LOW_CONFIDENCE: '🟡 Low Confidence',
   UNSUPPORTED_SITE: '⊘ Unsupported Site',
   USER_REQUIRED: '👤 User Input Required',
+  WAITING_USER: '⏳ Waiting for File / User',
 };
 
 const TASK_STATE_COLORS: Record<TaskState, string> = {
@@ -75,6 +76,7 @@ const TASK_STATE_COLORS: Record<TaskState, string> = {
   LOW_CONFIDENCE: '#f59e0b',
   UNSUPPORTED_SITE: '#64748b',
   USER_REQUIRED: '#f59e0b',
+  WAITING_USER: '#f59e0b',
 };
 
 function formatPill(pill?: string | { action: string; target?: string; confidence?: number }): string {
@@ -555,9 +557,11 @@ export function UnifiedLiveConsole() {
     chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [chatMessages, showInspectorDrawer]);
 
+  const isAwaitingUserInput = taskState === 'USER_REQUIRED' || taskState === 'WAITING_USER';
+
   const sendPrompt = useCallback(async () => {
     const text = promptText.trim();
-    if (!text || running) return;
+    if (!text || (running && !isAwaitingUserInput)) return;
     setPromptText('');
     setRunning(true);
     setTaskState('SCANNING');
@@ -1156,21 +1160,28 @@ export function UnifiedLiveConsole() {
           value={promptText}
           onChange={(e) => setPromptText(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && sendPrompt()}
-          placeholder="Type instruction... (e.g. Find Merge PDF)"
-          disabled={running}
+          placeholder={
+            taskState === 'USER_REQUIRED'
+              ? 'Enter required details or answer here...'
+              : taskState === 'WAITING_USER'
+              ? 'Select file in browser or type instruction...'
+              : 'Type instruction... (e.g. Find Merge PDF)'
+          }
+          disabled={running && !isAwaitingUserInput}
           style={{
             flex: 1,
-            background: '#050d1a',
-            border: '1px solid #1e3a5f',
+            background: isAwaitingUserInput ? '#0c2240' : '#050d1a',
+            border: isAwaitingUserInput ? '1px solid #38bdf8' : '1px solid #1e3a5f',
             borderRadius: 6,
             padding: '7px 10px',
             color: '#ffffff',
             fontSize: 10.5,
             outline: 'none',
-            opacity: running ? 0.6 : 1,
+            opacity: (running && !isAwaitingUserInput) ? 0.6 : 1,
+            boxShadow: isAwaitingUserInput ? '0 0 10px rgba(56,189,248,0.25)' : 'none',
           }}
         />
-        {running ? (
+        {running && !isAwaitingUserInput ? (
           <button
             onClick={stopTask}
             style={{
@@ -1192,7 +1203,7 @@ export function UnifiedLiveConsole() {
             disabled={!promptText.trim()}
             style={{
               background: promptText.trim()
-                ? 'linear-gradient(135deg, #0284c7, #0891b2)'
+                ? (isAwaitingUserInput ? 'linear-gradient(135deg, #0ea5e9, #2563eb)' : 'linear-gradient(135deg, #0284c7, #0891b2)')
                 : '#1e293b',
               color: '#ffffff',
               border: 'none',
@@ -1205,7 +1216,7 @@ export function UnifiedLiveConsole() {
               boxShadow: promptText.trim() ? '0 2px 8px rgba(2,132,199,0.3)' : 'none',
             }}
           >
-            Send
+            {isAwaitingUserInput ? 'Submit' : 'Send'}
           </button>
         )}
       </div>

@@ -24,6 +24,7 @@ import { buildRegistry, checkAndResetIfNeeded } from './element-registry';
 import { extractA11yTree, formatA11yForLLM } from './accessibility';
 import { getAdapter, getSiteStatus } from '../adapters/adapter-registry';
 import { injectFloatingPanel, toggleFloatingPanel, removeFloatingPanel, isFloatingPanelVisible, updatePanelStats } from './floating-panel';
+import { updateAgentBorder, removeAgentBorder } from './agent-border';
 import type {
   ExtensionMessage, PIIEntity, UIElement, SanitizedContext,
   BoundingBox, PrivacySettings, AuditEvent, ElementRecord
@@ -351,6 +352,21 @@ async function analyzePage(
   let faceEntities: PIIEntity[] = [];
   let screenCanvas: HTMLCanvasElement | undefined;
 
+  // If raw screenshot was not passed directly, request it from background service worker
+  if (!rawScreenshot && typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
+    try {
+      const shotResp = await new Promise<any>((resolve) => {
+        chrome.runtime.sendMessage({ type: 'CAPTURE_SCREENSHOT' }, (r) => {
+          if (chrome.runtime.lastError || !r) resolve(null);
+          else resolve(r);
+        });
+      });
+      if (shotResp && (shotResp.dataUrl || shotResp.screenshot)) {
+        rawScreenshot = shotResp.dataUrl || shotResp.screenshot;
+      }
+    } catch {}
+  }
+
   if (rawScreenshot) {
     try {
       const img = new Image();
@@ -366,9 +382,11 @@ async function analyzePage(
     }
   }
 
+  const dpr = window.devicePixelRatio || 1;
+
   if (currentSettings.enableFaceDetection) {
     try {
-      const faces = await detectFaces(screenCanvas);
+      const faces = await detectFaces(screenCanvas, dpr);
       faceEntities = faces.map(f => createFaceEntity(f.bbox, f.confidence, f.domElement, f.isFixed));
     } catch (err) {
       console.warn('[PrivacyAgent] Face detection warning:', err);
@@ -384,7 +402,7 @@ async function analyzePage(
   let yolosStats: VisionInferenceStats | undefined;
   if (screenCanvas && currentSettings.enableFaceDetection) {
     try {
-      const yolosResult = await runYOLOSDetection(screenCanvas, window.scrollX, window.scrollY);
+      const yolosResult = await runYOLOSDetection(screenCanvas, window.scrollX, window.scrollY, 0.70, dpr);
       yolosEntities = yolosResult.entities;
       yolosStats = yolosResult.stats;
       if (yolosEntities.length > 0) {
@@ -466,27 +484,55 @@ async function analyzePage(
     }
   }
 
-  // Fallback: If raw screenshot capture was restricted by browser, synthesize a high-fidelity sanitized preview
-  if (!sanitizedScreenshot && appliedEntities.length > 0) {
+  // Fallback: If raw screenshot capture was restricted by browser, synthesize a high-fidelity visual preview
+  if (!sanitizedScreenshot) {
     try {
       const fbCanvas = document.createElement('canvas');
       fbCanvas.width = 640;
       fbCanvas.height = 360;
       const fCtx = fbCanvas.getContext('2d');
       if (fCtx) {
-        fCtx.fillStyle = '#0a1120';
+        // Page background
+        fCtx.fillStyle = '#0f172a';
         fCtx.fillRect(0, 0, 640, 360);
-        // Header
-        fCtx.fillStyle = '#0f2347';
-        fCtx.fillRect(0, 0, 640, 32);
+
+        // Top browser navigation bar
+        fCtx.fillStyle = '#1e293b';
+        fCtx.fillRect(0, 0, 640, 34);
         fCtx.fillStyle = '#38bdf8';
         fCtx.font = 'bold 11px sans-serif';
-        fCtx.fillText(`🛡️ PRIVSIGHT — On-Device Redaction Preview (${location.hostname})`, 12, 20);
+        const displayHost = location.hostname || 'page';
+        fCtx.fillText(`🛡️ PRIVSIGHT — Visual Perception Preview (${displayHost})`, 12, 21);
 
-        // Scale bounding boxes
-        const scaleX = 640 / Math.max(window.innerWidth, 1);
-        const scaleY = 360 / Math.max(window.innerHeight, 1);
+        // Render interactive UI elements onto canvas
+        const scaleX = 640 / Math.max(window.innerWidth || 1280, 1);
+        const scaleY = 360 / Math.max(window.innerHeight || 800, 1);
 
+        for (const el of rawElements.slice(0, 40)) {
+          if (!el.bbox) continue;
+          const ex = Math.max(8, Math.min(600, (el.bbox.x - window.scrollX) * scaleX));
+          const ey = Math.max(38, Math.min(320, (el.bbox.y - window.scrollY) * scaleY));
+          const ew = Math.max(30, Math.min(260, el.bbox.width * scaleX));
+          const eh = Math.max(14, Math.min(80, el.bbox.height * scaleY));
+
+          const isBtn = el.type === 'button' || el.tagName === 'button';
+          const isInput = el.type === 'text' || el.type === 'input' || el.tagName === 'input';
+
+          fCtx.fillStyle = isBtn ? 'rgba(56, 189, 248, 0.25)' : isInput ? 'rgba(148, 163, 184, 0.2)' : 'rgba(51, 65, 85, 0.4)';
+          fCtx.fillRect(ex, ey, ew, eh);
+          fCtx.strokeStyle = isBtn ? '#38bdf8' : isInput ? '#94a3b8' : '#475569';
+          fCtx.lineWidth = 1;
+          fCtx.strokeRect(ex, ey, ew, eh);
+
+          if (el.label && ew > 30) {
+            fCtx.fillStyle = isBtn ? '#bae6fd' : '#e2e8f0';
+            fCtx.font = '9px sans-serif';
+            const shortLabel = el.label.length > 20 ? el.label.slice(0, 18) + '...' : el.label;
+            fCtx.fillText(shortLabel, ex + 3, ey + Math.min(12, eh / 2 + 3));
+          }
+        }
+
+        // Redacted PII elements on top
         for (const ent of appliedEntities) {
           if (!ent.bbox) continue;
           const bx = Math.max(10, (ent.bbox.x - window.scrollX) * scaleX);
@@ -494,7 +540,7 @@ async function analyzePage(
           const bw = Math.max(50, ent.bbox.width * scaleX);
           const bh = Math.max(22, ent.bbox.height * scaleY);
 
-          fCtx.fillStyle = ent.sensitivity === 'CRITICAL' ? '#1c1917' : 'rgba(234, 88, 12, 0.45)';
+          fCtx.fillStyle = ent.sensitivity === 'CRITICAL' ? '#1c1917' : 'rgba(234, 88, 12, 0.5)';
           fCtx.fillRect(bx, by, bw, bh);
           fCtx.strokeStyle = ent.sensitivity === 'CRITICAL' ? '#ef4444' : '#f97316';
           fCtx.lineWidth = 1.5;
@@ -514,7 +560,9 @@ async function analyzePage(
         sanitizedScreenshot = fbCanvas.toDataURL('image/webp', 0.82);
         screenshotIncluded = true;
       }
-    } catch {}
+    } catch (fbCanvasErr) {
+      console.warn('[PrivacyAgent] Fallback canvas generation error:', fbCanvasErr);
+    }
   }
 
   const redactionMs = Date.now() - t_redact;
@@ -571,6 +619,7 @@ async function analyzePage(
     pageTitle: title,
     pageType,
     timestamp: Date.now(),
+    rawElements: (rawElements || []).slice(0, 50),
     elements: sanitizedElems,
     sanitizedText,
     ocrTexts,
@@ -599,10 +648,13 @@ async function analyzePage(
       body: JSON.stringify({
         url: context.pageUrl || url,
         title: context.pageTitle || title,
-        piiSummary: context.piiSummary,
-        sanitizedScreenshot: context.sanitizedScreenshot,
-        sanitizedText: (context.sanitizedText || '').slice(0, 3000),
+        rawScreenshot: rawScreenshot || sanitizedScreenshot,
+        sanitizedScreenshot: context.sanitizedScreenshot || sanitizedScreenshot,
+        rawElements: (rawElements || []).slice(0, 50),
         elements: (context.elements || []).slice(0, 50),
+        piiSummary: context.piiSummary,
+        rawText: (context.sanitizedText || '').slice(0, 3000),
+        sanitizedText: (context.sanitizedText || '').slice(0, 3000),
         step: 1,
         task: 'Page Privacy Scan',
         piiEntities: cleanEntities,
@@ -689,27 +741,58 @@ function renderOverlay(entities: PIIEntity[]): void {
       if (vpX >= 0 && vpX <= window.innerWidth && vpY >= 0 && vpY <= window.innerHeight) {
         const probe = document.elementFromPoint(vpX, vpY);
         if (probe && !probe.closest('#__privacy-agent-overlay__, #__privsight-host__')) {
-          targetEl = probe.closest('img, svg, canvas, [class*="avatar"], input, textarea, a, button, span, div') || probe;
+          if (entity?.type === 'face') {
+            targetEl = probe.closest('img, canvas, svg, [class*="avatar"], [class*="profile-photo"], [class*="user-photo"], [itemprop="image"]') || null;
+          } else {
+            targetEl = probe.closest('input, textarea, select, [contenteditable="true"]') || null;
+          }
         }
       }
     }
 
+    // Validate targetEl: NEVER use layout containers (div, section, main, body) or oversized elements
+    if (targetEl) {
+      const r = targetEl.getBoundingClientRect();
+      const isLayoutTag = ['HTML', 'BODY', 'MAIN', 'SECTION', 'ARTICLE', 'DIV'].includes(targetEl.tagName.toUpperCase());
+      const isOversized = r.width > window.innerWidth * 0.4 || r.height > window.innerHeight * 0.4 || (entity?.type === 'face' && (r.width > 350 || r.height > 350));
+      if (isOversized || (isLayoutTag && entity?.type === 'face')) {
+        targetEl = null;
+      }
+    }
+
+    // If using bbox directly for a face, discard anomalous huge boxes
+    if (!targetEl && entity?.type === 'face' && (bbox.width > 350 || bbox.height > 350 || (bbox.width * bbox.height > window.innerWidth * window.innerHeight * 0.15))) {
+      continue; // Skip anomalous false-positive face boxes that would cover large portions of the screen
+    }
+
     const isFixed = boxIsFixed || (targetEl ? isElementFixedOrSticky(targetEl) : false);
 
-    const box = document.createElement('div');
-    const isSensitive = !entity || entity.sensitivity === 'CRITICAL' || entity.sensitivity === 'HIGH' || entity.type === 'face' || entity.type === 'email' || entity.type === 'password' || entity.type === 'phone' || entity.type === 'name';
-    const blurStyle = isSensitive ? 'backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);' : '';
+    let boxLeft = 0;
+    let boxTop = 0;
+    let boxWidth = 0;
+    let boxHeight = 0;
 
     if (targetEl) {
       const rect = targetEl.getBoundingClientRect();
-      if (isFixed) {
-        box.style.cssText = `position:fixed;left:${Math.round(rect.left)}px;top:${Math.round(rect.top)}px;width:${Math.round(rect.width)}px;height:${Math.round(rect.height)}px;border:2px solid ${color};background:${color}25;${blurStyle}pointer-events:none;border-radius:4px;box-sizing:border-box;z-index:2147483640;`;
-      } else {
-        box.style.cssText = `position:absolute;left:${Math.round(rect.left + window.scrollX)}px;top:${Math.round(rect.top + window.scrollY)}px;width:${Math.round(rect.width)}px;height:${Math.round(rect.height)}px;border:2px solid ${color};background:${color}25;${blurStyle}pointer-events:none;border-radius:4px;box-sizing:border-box;z-index:2147483640;`;
-      }
+      boxLeft = isFixed ? Math.round(rect.left) : Math.round(rect.left + window.scrollX);
+      boxTop = isFixed ? Math.round(rect.top) : Math.round(rect.top + window.scrollY);
+      boxWidth = Math.round(rect.width);
+      boxHeight = Math.round(rect.height);
     } else {
-      box.style.cssText = `position:absolute;left:${bbox.x}px;top:${bbox.y}px;width:${bbox.width}px;height:${bbox.height}px;border:2px solid ${color};background:${color}25;${blurStyle}pointer-events:none;border-radius:4px;box-sizing:border-box;z-index:2147483640;`;
+      boxLeft = bbox.x;
+      boxTop = bbox.y;
+      boxWidth = bbox.width;
+      boxHeight = bbox.height;
     }
+
+    // Never blur if the box is abnormally large (more than 40% of viewport in either dimension)
+    const isReasonablySized = boxWidth <= window.innerWidth * 0.4 && boxHeight <= window.innerHeight * 0.4 && boxWidth <= 400 && boxHeight <= 400;
+    const isSensitive = !entity || entity.sensitivity === 'CRITICAL' || entity.sensitivity === 'HIGH' || entity.type === 'face' || entity.type === 'email' || entity.type === 'password' || entity.type === 'phone' || entity.type === 'name';
+    const blurStyle = (isSensitive && isReasonablySized) ? 'backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);' : '';
+    const posStyle = isFixed ? 'position:fixed;' : 'position:absolute;';
+
+    const box = document.createElement('div');
+    box.style.cssText = `${posStyle}left:${boxLeft}px;top:${boxTop}px;width:${boxWidth}px;height:${boxHeight}px;border:2px solid ${color};background:${color}25;${blurStyle}pointer-events:none;border-radius:4px;box-sizing:border-box;z-index:2147483640;`;
 
     const lbl = document.createElement('div');
     lbl.style.cssText = `position:absolute;top:-20px;left:0;background:${color};color:#fff;font:bold 10px monospace;padding:2px 6px;border-radius:3px;white-space:nowrap;pointer-events:none;`;
@@ -863,6 +946,35 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
         sendResponse({ ok: true, visible: isVisible });
         break;
       }
+
+      case 'TASK_STATE_CHANGE': {
+        const state = (message as any).taskState;
+        updateAgentBorder(state);
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'STATUS_UPDATE': {
+        const state = (message as any).taskState || (message as any).status;
+        updateAgentBorder(state);
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'STEP_UPDATE': {
+        const step = message as any;
+        if (step?.label) {
+          updateAgentBorder('EXECUTING', step.label);
+        }
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'TASK_DONE': {
+        removeAgentBorder();
+        sendResponse({ ok: true });
+        break;
+      }
     }
   })();
   return true; // Keep message channel open for async response
@@ -926,3 +1038,13 @@ window.addEventListener('privsight:scan', async () => {
 
 console.log('[PrivacyAgent] Content script initialized on', location.href,
   '| Site:', getSiteStatus(location.href).compatibility);
+
+// Query background on page load so agent border shows immediately if a task is running
+try {
+  chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (resp) => {
+    if (chrome.runtime.lastError) return;
+    if (resp?.taskState && resp.taskState !== 'IDLE' && resp.taskState !== 'COMPLETED' && resp.taskState !== 'ERROR') {
+      updateAgentBorder(resp.taskState);
+    }
+  });
+} catch {}
