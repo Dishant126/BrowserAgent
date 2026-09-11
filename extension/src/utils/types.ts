@@ -335,5 +335,12 @@ export type ExtensionMessage =
   | { type: 'CLEAR_OVERLAYS' }
   | { type: 'VIT_INFERENCE'; imageData?: string; requestId?: string; threshold?: number }
   | { type: 'VERIFY_PII'; candidates?: string[]; url?: string }
-  | { type: 'REDACTED_PREVIEW'; dataUrl?: string; entitiesApplied?: number; piiTypes?: string[] };
+  | { type: 'REDACTED_PREVIEW'; dataUrl?: string; entitiesApplied?: number; piiTypes?: string[] }
+  | { type: 'START_VOICE_INPUT' }
+  | { type: 'STOP_VOICE_INPUT' }
+  | { type: 'VOICE_STATE_CHANGE'; isListening: boolean }
+  | { type: 'VOICE_TRANSCRIPT'; transcript: string; isFinal?: boolean }
+  | { type: 'VOICE_ERROR'; errorMsg: string; errorCode?: string }
+  | { type: 'SPEAK_ACTION_STATUS'; text: string; actionType?: string }
+  | { type: 'VOICE_OUTPUT_TOGGLED'; enabled: boolean };
 

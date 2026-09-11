@@ -105,8 +105,8 @@ async def update_perception(data: dict):
                 _session_pii_history[sess_id].append(ent)
     entry = {
         **data,
-        "rawScreenshot": data.get("rawScreenshot"),
-        "sanitizedScreenshot": data.get("sanitizedScreenshot"),
+        "rawScreenshot": data.get("rawScreenshot") or (_latest_perception.get("rawScreenshot") if _latest_perception else None),
+        "sanitizedScreenshot": data.get("sanitizedScreenshot") or (_latest_perception.get("sanitizedScreenshot") if _latest_perception else None),
         "rawElements": data.get("rawElements") or data.get("elements") or [],
         "elements": data.get("elements") or [],
         "rawText": data.get("rawText") or data.get("sanitizedText") or "",
@@ -362,8 +362,8 @@ async def get_action(request: ActionRequest, db: AsyncSession = Depends(get_db))
     san_shot = (
         getattr(request.context, "sanitizedScreenshot", None) or
         getattr(request.context, "screenshot", None) or
-        (_latest_perception.get("sanitizedScreenshot") if _latest_perception else None) or
-        raw_shot
+        raw_shot or
+        (_latest_perception.get("sanitizedScreenshot") if _latest_perception else None)
     )
     raw_elems = (
         getattr(request, "rawElements", None) or

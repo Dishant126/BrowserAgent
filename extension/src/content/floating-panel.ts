@@ -8,6 +8,11 @@
  */
 
 import type { ChatMessage, TraceEvent, SiteStatus } from '../utils/types';
+import {
+  SpeechRecognitionManager,
+  isSpeechRecognitionSupported,
+} from '../utils/speech-recognition';
+import { voiceOutputManager } from '../utils/speech-synthesis';
 
 export function isFloatingPanelVisible(): boolean {
   const host = document.getElementById('__privsight-host__');
@@ -484,6 +489,36 @@ export function injectFloatingPanel(forceShow = false): void {
     #prompt-input:focus { border-color: #22d3ee; }
     #prompt-input:disabled { opacity: 0.5; cursor: not-allowed; }
 
+    #btn-mic {
+      background: #0f172a;
+      border: 1px solid #1e3a5f;
+      border-radius: 8px;
+      padding: 7px 10px;
+      font-size: 12px;
+      color: #38bdf8;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      transition: all 0.2s;
+      flex-shrink: 0;
+      line-height: 1;
+    }
+    #btn-mic:hover:not(:disabled) { border-color: #38bdf8; background: #1e293b; }
+    #btn-mic.listening {
+      background: #dc2626;
+      border-color: #f87171;
+      color: #ffffff;
+      box-shadow: 0 0 10px rgba(239, 68, 68, 0.6);
+      animation: pulse-mic 1.5s infinite;
+    }
+    #btn-mic:disabled { opacity: 0.4; cursor: not-allowed; }
+    @keyframes pulse-mic {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.06); }
+    }
+
     #btn-send {
       background: #0891b2;
       color: #ffffff;
@@ -695,6 +730,7 @@ export function injectFloatingPanel(forceShow = false): void {
 
       <div id="input-footer">
         <input id="prompt-input" type="text" placeholder="Type your instruction... (e.g. Find Merge PDF)" autocomplete="off" />
+        <button id="btn-mic" type="button" title="Voice Input (Speech-to-Text)">🎙️</button>
         <button id="btn-send">Send</button>
         <button id="btn-stop-live">■ Stop</button>
       </div>
@@ -705,7 +741,11 @@ export function injectFloatingPanel(forceShow = false): void {
         <a href="http://localhost:5173" target="_blank">Dashboard →</a>
         <button id="btn-mute-site" style="background:none;border:none;color:#64748b;font-size:9px;cursor:pointer;text-decoration:underline;">Mute site</button>
       </div>
-      <div>
+      <div style="display:flex;align-items:center;gap:8px;">
+        <button id="btn-voice-output" style="background:#0e2338;color:#22d3ee;border:1px solid #0284c7;border-radius:4px;padding:2px 6px;font-size:8.5px;font-weight:700;cursor:pointer;display:flex;align-items:center;gap:3px;" title="Voice Output is ON. Click to mute.">
+          <span id="voice-output-icon">🔊</span>
+          <span id="voice-output-text">Voice ON</span>
+        </button>
         <label style="font-size:9px;color:#64748b;display:flex;align-items:center;gap:4px;cursor:pointer;">
           <input type="checkbox" id="chk-auto-open" style="cursor:pointer;" /> Auto-open
         </label>
@@ -832,6 +872,7 @@ export function injectFloatingPanel(forceShow = false): void {
 
   // ── DOM ELEMENT REFS ────────────────────────────────────────────────────────
   const promptInput = shadow.getElementById('prompt-input') as HTMLInputElement;
+  const btnMic = shadow.getElementById('btn-mic') as HTMLButtonElement;
   const btnSend = shadow.getElementById('btn-send') as HTMLButtonElement;
   const btnStopLive = shadow.getElementById('btn-stop-live') as HTMLButtonElement;
   const statusBadge = shadow.getElementById('status-badge')!;
@@ -847,12 +888,21 @@ export function injectFloatingPanel(forceShow = false): void {
 
   let isTaskRunning = false;
   let currentTaskState = 'IDLE';
+  const speechManager = new SpeechRecognitionManager();
+  let isVoiceListening = false;
+  let baseVoiceText = '';
+
+  if (!speechManager.isSupported) {
+    btnMic.disabled = true;
+    btnMic.title = 'Voice input is not supported in this browser';
+  }
 
   function setRunningState(running: boolean, state?: string) {
     if (state) currentTaskState = state;
     const isAwaitingInput = currentTaskState === 'USER_REQUIRED' || currentTaskState === 'WAITING_USER';
     isTaskRunning = running && !isAwaitingInput;
     promptInput.disabled = running && !isAwaitingInput;
+    btnMic.disabled = !speechManager.isSupported || (running && !isAwaitingInput);
     btnSend.style.display = (running && !isAwaitingInput) ? 'none' : 'flex';
     btnStopLive.style.display = (running && !isAwaitingInput) ? 'flex' : 'none';
     if (currentTaskState === 'USER_REQUIRED') {
@@ -873,6 +923,9 @@ export function injectFloatingPanel(forceShow = false): void {
 
   // ── SEND INSTRUCTION ────────────────────────────────────────────────────────
   function sendInstruction() {
+    if (isVoiceListening) {
+      speechManager.stop();
+    }
     const text = promptInput.value.trim();
     const isAwaitingInput = currentTaskState === 'USER_REQUIRED' || currentTaskState === 'WAITING_USER';
     if (!text || (isTaskRunning && !isAwaitingInput)) return;
@@ -890,6 +943,68 @@ export function injectFloatingPanel(forceShow = false): void {
       }
     });
   }
+
+  btnMic.addEventListener('click', async () => {
+    if (!speechManager.isSupported) return;
+
+    if (isVoiceListening) {
+      speechManager.stop();
+      return;
+    }
+
+    baseVoiceText = promptInput.value;
+
+    // Directly prompt the user for microphone access on this webpage
+    try {
+      if (navigator.mediaDevices?.getUserMedia) {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((t) => t.stop());
+      }
+    } catch (err) {
+      console.warn('[PrivSight Voice] Mic permission dismissed/denied:', err);
+      setStatus('⚠️ Mic access denied', '#ef4444');
+      return;
+    }
+
+    speechManager.start(
+      {
+        onStateChange: (listening) => {
+          isVoiceListening = listening;
+          if (listening) {
+            btnMic.classList.add('listening');
+            btnMic.innerHTML = '🔴 <span style="font-size:9px;font-weight:700">Stop</span>';
+            btnMic.title = 'Listening... Click to stop';
+            if (!promptInput.value.trim()) {
+              promptInput.placeholder = '🎙️ Listening... Speak your instruction now...';
+            }
+          } else {
+            btnMic.classList.remove('listening');
+            btnMic.innerHTML = '🎙️';
+            btnMic.title = 'Voice Input (Speech-to-Text)';
+            if (promptInput.placeholder.includes('Listening')) {
+              promptInput.placeholder = 'Type your instruction... (e.g. Find Merge PDF)';
+            }
+          }
+        },
+        onTranscript: (transcript) => {
+          const base = baseVoiceText.trim();
+          promptInput.value = base ? `${base} ${transcript}` : transcript;
+        },
+        onError: (errorMsg, errCode) => {
+          isVoiceListening = false;
+          btnMic.classList.remove('listening');
+          btnMic.innerHTML = '🎙️';
+          btnMic.title = 'Voice Input (Speech-to-Text)';
+          if (errCode === 'not-allowed' || errCode === 'service-not-allowed') {
+            setStatus('⚠️ Mic denied in browser', '#ef4444');
+          } else if (errCode !== 'aborted') {
+            setStatus(`⚠️ ${errorMsg.slice(0, 24)}`, '#ef4444');
+          }
+        },
+      },
+      ''
+    );
+  });
 
   btnSend.addEventListener('click', sendInstruction);
   promptInput.addEventListener('keydown', (e) => {
@@ -1172,9 +1287,52 @@ export function injectFloatingPanel(forceShow = false): void {
     if (msg.type === 'TOGGLE_FLOATING_PANEL') {
       if (msg.show === false) removeFloatingPanel();
     }
+
+    if (msg.type === 'VOICE_OUTPUT_TOGGLED' && typeof msg.enabled === 'boolean') {
+      voiceOutputManager.setEnabled(msg.enabled);
+      updateVoiceOutputUI(msg.enabled);
+    }
   });
 
-  // ── SETTINGS: AUTO-OPEN & MUTE ──────────────────────────────────────────────
+  // ── SETTINGS: AUTO-OPEN, VOICE OUTPUT & MUTE ────────────────────────────────
+  const btnVoiceOutput = shadow.getElementById('btn-voice-output') as HTMLButtonElement;
+  const voiceOutputIcon = shadow.getElementById('voice-output-icon');
+  const voiceOutputText = shadow.getElementById('voice-output-text');
+
+  function updateVoiceOutputUI(enabled: boolean, speaking?: boolean) {
+    if (!btnVoiceOutput || !voiceOutputIcon || !voiceOutputText) return;
+    if (enabled) {
+      btnVoiceOutput.style.background = speaking ? '#0c2d48' : '#0e2338';
+      btnVoiceOutput.style.color = speaking ? '#38bdf8' : '#22d3ee';
+      btnVoiceOutput.style.borderColor = speaking ? '#38bdf8' : '#0284c7';
+      voiceOutputIcon.textContent = '🔊';
+      voiceOutputText.textContent = speaking ? 'Speaking...' : 'Voice ON';
+      btnVoiceOutput.title = 'Voice Output is ON. Click to mute.';
+    } else {
+      btnVoiceOutput.style.background = '#1c1924';
+      btnVoiceOutput.style.color = '#94a3b8';
+      btnVoiceOutput.style.borderColor = '#334155';
+      voiceOutputIcon.textContent = '🔇';
+      voiceOutputText.textContent = 'Voice OFF';
+      btnVoiceOutput.title = 'Voice Output is OFF. Click to unmute.';
+    }
+  }
+
+  updateVoiceOutputUI(voiceOutputManager.isEnabled());
+  voiceOutputManager.subscribe((speaking, enabled) => {
+    updateVoiceOutputUI(enabled, speaking);
+  });
+
+  if (btnVoiceOutput) {
+    btnVoiceOutput.addEventListener('click', (e) => {
+      e.stopPropagation();
+      e.preventDefault();
+      const next = !voiceOutputManager.isEnabled();
+      voiceOutputManager.setEnabled(next);
+      chrome.runtime.sendMessage({ type: 'VOICE_OUTPUT_TOGGLED', enabled: next }).catch(() => {});
+    });
+  }
+
   const chkAutoOpen = shadow.getElementById('chk-auto-open') as HTMLInputElement;
   if (chkAutoOpen) {
     chrome.storage.local.get(['autoShowFloatingPanel'], (res) => {

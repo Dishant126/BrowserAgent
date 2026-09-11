@@ -25,6 +25,8 @@ import { extractA11yTree, formatA11yForLLM } from './accessibility';
 import { getAdapter, getSiteStatus } from '../adapters/adapter-registry';
 import { injectFloatingPanel, toggleFloatingPanel, removeFloatingPanel, isFloatingPanelVisible, updatePanelStats } from './floating-panel';
 import { updateAgentBorder, removeAgentBorder } from './agent-border';
+import { SpeechRecognitionManager } from '../utils/speech-recognition';
+import { voiceOutputManager } from '../utils/speech-synthesis';
 import type {
   ExtensionMessage, PIIEntity, UIElement, SanitizedContext,
   BoundingBox, PrivacySettings, AuditEvent, ElementRecord
@@ -484,87 +486,6 @@ async function analyzePage(
     }
   }
 
-  // Fallback: If raw screenshot capture was restricted by browser, synthesize a high-fidelity visual preview
-  if (!sanitizedScreenshot) {
-    try {
-      const fbCanvas = document.createElement('canvas');
-      fbCanvas.width = 640;
-      fbCanvas.height = 360;
-      const fCtx = fbCanvas.getContext('2d');
-      if (fCtx) {
-        // Page background
-        fCtx.fillStyle = '#0f172a';
-        fCtx.fillRect(0, 0, 640, 360);
-
-        // Top browser navigation bar
-        fCtx.fillStyle = '#1e293b';
-        fCtx.fillRect(0, 0, 640, 34);
-        fCtx.fillStyle = '#38bdf8';
-        fCtx.font = 'bold 11px sans-serif';
-        const displayHost = location.hostname || 'page';
-        fCtx.fillText(`🛡️ PRIVSIGHT — Visual Perception Preview (${displayHost})`, 12, 21);
-
-        // Render interactive UI elements onto canvas
-        const scaleX = 640 / Math.max(window.innerWidth || 1280, 1);
-        const scaleY = 360 / Math.max(window.innerHeight || 800, 1);
-
-        for (const el of rawElements.slice(0, 40)) {
-          if (!el.bbox) continue;
-          const ex = Math.max(8, Math.min(600, (el.bbox.x - window.scrollX) * scaleX));
-          const ey = Math.max(38, Math.min(320, (el.bbox.y - window.scrollY) * scaleY));
-          const ew = Math.max(30, Math.min(260, el.bbox.width * scaleX));
-          const eh = Math.max(14, Math.min(80, el.bbox.height * scaleY));
-
-          const isBtn = el.type === 'button' || el.tagName === 'button';
-          const isInput = el.type === 'text' || el.type === 'input' || el.tagName === 'input';
-
-          fCtx.fillStyle = isBtn ? 'rgba(56, 189, 248, 0.25)' : isInput ? 'rgba(148, 163, 184, 0.2)' : 'rgba(51, 65, 85, 0.4)';
-          fCtx.fillRect(ex, ey, ew, eh);
-          fCtx.strokeStyle = isBtn ? '#38bdf8' : isInput ? '#94a3b8' : '#475569';
-          fCtx.lineWidth = 1;
-          fCtx.strokeRect(ex, ey, ew, eh);
-
-          if (el.label && ew > 30) {
-            fCtx.fillStyle = isBtn ? '#bae6fd' : '#e2e8f0';
-            fCtx.font = '9px sans-serif';
-            const shortLabel = el.label.length > 20 ? el.label.slice(0, 18) + '...' : el.label;
-            fCtx.fillText(shortLabel, ex + 3, ey + Math.min(12, eh / 2 + 3));
-          }
-        }
-
-        // Redacted PII elements on top
-        for (const ent of appliedEntities) {
-          if (!ent.bbox) continue;
-          const bx = Math.max(10, (ent.bbox.x - window.scrollX) * scaleX);
-          const by = Math.max(38, (ent.bbox.y - window.scrollY) * scaleY);
-          const bw = Math.max(50, ent.bbox.width * scaleX);
-          const bh = Math.max(22, ent.bbox.height * scaleY);
-
-          fCtx.fillStyle = ent.sensitivity === 'CRITICAL' ? '#1c1917' : 'rgba(234, 88, 12, 0.5)';
-          fCtx.fillRect(bx, by, bw, bh);
-          fCtx.strokeStyle = ent.sensitivity === 'CRITICAL' ? '#ef4444' : '#f97316';
-          fCtx.lineWidth = 1.5;
-          fCtx.strokeRect(bx, by, bw, bh);
-
-          fCtx.fillStyle = '#ffffff';
-          fCtx.font = 'bold 9px monospace';
-          fCtx.fillText(`[${ent.type.toUpperCase()} REDACTED]`, bx + 4, by + Math.min(14, bh / 2 + 3));
-        }
-
-        // Footer watermark & legend
-        fCtx.fillStyle = '#64748b';
-        fCtx.font = 'bold 9px monospace';
-        fCtx.fillText('🔒 Sanitized locally — 0 raw pixels sent', 12, 348);
-        fCtx.fillText('CRITICAL - blackout | HIGH - blur | MEDIUM - mosaic', 340, 348);
-
-        sanitizedScreenshot = fbCanvas.toDataURL('image/webp', 0.82);
-        screenshotIncluded = true;
-      }
-    } catch (fbCanvasErr) {
-      console.warn('[PrivacyAgent] Fallback canvas generation error:', fbCanvasErr);
-    }
-  }
-
   const redactionMs = Date.now() - t_redact;
 
   // ── Stage 7: Overlay rendering ────────────────────────────────────────────────
@@ -639,28 +560,6 @@ async function analyzePage(
 
   lastStateHash = stateHash;
   lastAnalysisContext = context;
-
-  // Asynchronously notify reasoning server so dashboard Live View updates instantly
-  try {
-    fetch('http://localhost:8000/api/perception/update', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        url: context.pageUrl || url,
-        title: context.pageTitle || title,
-        rawScreenshot: rawScreenshot || sanitizedScreenshot,
-        sanitizedScreenshot: context.sanitizedScreenshot || sanitizedScreenshot,
-        rawElements: (rawElements || []).slice(0, 50),
-        elements: (context.elements || []).slice(0, 50),
-        piiSummary: context.piiSummary,
-        rawText: (context.sanitizedText || '').slice(0, 3000),
-        sanitizedText: (context.sanitizedText || '').slice(0, 3000),
-        step: 1,
-        task: 'Page Privacy Scan',
-        piiEntities: cleanEntities,
-      }),
-    }).catch(() => {});
-  } catch {}
 
   console.log(`[PrivacyAgent] Analysis in ${totalClientMs}ms | DOM:${domAnalysisMs}ms PII:${piiDetectionMs}ms OCR:${ocrMs}ms Face:${faceDetectionMs}ms Redact:${redactionMs}ms | Level ${perceptionLevel} | PII: ${appliedEntities.length} | Screenshot: ${screenshotIncluded}`);
   return { context, metrics };
@@ -841,6 +740,57 @@ function emitAuditEvent(type: AuditEvent['type'], data: Partial<AuditEvent>): vo
   chrome.runtime.sendMessage({ type: 'AUDIT_EVENT', event }).catch(() => {});
 }
 
+// ── VOICE RECOGNITION (DELEGATED FROM POPUP FOR DIRECT NATIVE PROMPT) ────────
+let onPageVoiceManager: SpeechRecognitionManager | null = null;
+
+function handleStartVoiceInput(): boolean {
+  if (!onPageVoiceManager) {
+    onPageVoiceManager = new SpeechRecognitionManager();
+  }
+  if (!onPageVoiceManager.isSupported) {
+    chrome.runtime.sendMessage({
+      type: 'VOICE_ERROR',
+      errorMsg: 'Voice recognition is not supported in this browser.',
+      errorCode: 'not-supported',
+    });
+    return false;
+  }
+
+  // Directly trigger Chrome's native microphone prompt on this webpage
+  try {
+    if (navigator.mediaDevices?.getUserMedia) {
+      navigator.mediaDevices.getUserMedia({ audio: true }).then((stream) => {
+        stream.getTracks().forEach((t) => t.stop());
+      }).catch(() => {
+        chrome.runtime.sendMessage({
+          type: 'VOICE_ERROR',
+          errorMsg: 'Microphone permission denied.',
+          errorCode: 'not-allowed',
+        });
+      });
+    }
+  } catch {}
+
+  return onPageVoiceManager.start(
+    {
+      onStateChange: (listening) => {
+        chrome.runtime.sendMessage({ type: 'VOICE_STATE_CHANGE', isListening: listening });
+      },
+      onTranscript: (transcript, isFinal) => {
+        chrome.runtime.sendMessage({ type: 'VOICE_TRANSCRIPT', transcript, isFinal });
+      },
+      onError: (errorMsg, errorCode) => {
+        chrome.runtime.sendMessage({ type: 'VOICE_ERROR', errorMsg, errorCode });
+      },
+    },
+    ''
+  );
+}
+
+function handleStopVoiceInput(): void {
+  onPageVoiceManager?.stop();
+}
+
 // ── MESSAGE HANDLER ────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendResponse) => {
@@ -944,6 +894,44 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
       case 'TOGGLE_FLOATING_PANEL': {
         const isVisible = toggleFloatingPanel(message.show);
         sendResponse({ ok: true, visible: isVisible });
+        break;
+      }
+
+      case 'START_VOICE_INPUT': {
+        const ok = handleStartVoiceInput();
+        sendResponse({ ok });
+        break;
+      }
+
+      case 'STOP_VOICE_INPUT': {
+        handleStopVoiceInput();
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'SPEAK_ACTION_STATUS': {
+        const text = (message as any).text;
+        if (text) {
+          try {
+            chrome.storage.session?.get(['popupOpen'], (sessionRes) => {
+              if (!sessionRes?.popupOpen) {
+                voiceOutputManager.speak(text);
+              }
+            });
+          } catch {
+            voiceOutputManager.speak(text);
+          }
+        }
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'VOICE_OUTPUT_TOGGLED': {
+        const enabled = (message as any).enabled;
+        if (typeof enabled === 'boolean') {
+          voiceOutputManager.setEnabled(enabled);
+        }
+        sendResponse({ ok: true });
         break;
       }
 

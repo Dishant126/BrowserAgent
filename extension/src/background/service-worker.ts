@@ -15,6 +15,7 @@ import type {
   ExtensionMessage, BrowserAction, SanitizedContext, AuditEvent,
   TaskState, SiteStatus, SiteCompatibility, ChatMessage, TraceEvent, TraceEventType
 } from '../utils/types';
+import { getSafeSpokenActionMessage, getDomainFromUrl } from '../utils/speech-synthesis';
 
 const SERVER_URL = 'http://localhost:8000/api';
 const MAX_STEPS = 20;
@@ -392,6 +393,30 @@ if (typeof chrome !== 'undefined' && chrome.downloads?.onCreated) {
     }
   });
 }
+if (typeof chrome !== 'undefined' && chrome.tabs?.onCreated) {
+  chrome.tabs.onCreated.addListener((tab) => {
+    if (currentTask.stepNumber > 0 && !currentTask.stopped && currentTask.taskState !== 'IDLE' && currentTask.taskState !== 'COMPLETED') {
+      if (tab.id && tab.openerTabId === currentActiveTabId) {
+        console.log('[Background] New tab opened by agent action:', tab.id, tab.url);
+        currentActiveTabId = tab.id;
+      }
+    }
+  });
+}
+
+if (typeof chrome !== 'undefined' && chrome.tabs?.onActivated) {
+  chrome.tabs.onActivated.addListener((activeInfo) => {
+    if (currentTask.stepNumber > 0 && !currentTask.stopped && currentTask.taskState !== 'IDLE' && currentTask.taskState !== 'COMPLETED') {
+      chrome.tabs.get(activeInfo.tabId).then((tab) => {
+        const u = (tab?.url || '').toLowerCase();
+        // Never switch active task context to dashboard or internal extension pages
+        if (!u.includes('localhost:5173') && !u.includes('127.0.0.1:5173') && !u.startsWith('chrome://') && !u.startsWith('chrome-extension://')) {
+          currentActiveTabId = activeInfo.tabId;
+        }
+      }).catch(() => {});
+    }
+  });
+}
 
 // ── TASK RUNNER LOOP ──────────────────────────────────────────────────────────
 
@@ -419,6 +444,40 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
 
   emitTraceEvent('PROMPT_RECEIVED', `User prompt: "${instruction}"`, currentTask.stepNumber);
 
+  // Determine target URL early so we can pick or create the appropriate tab
+  let destinationUrl = targetUrl;
+  if (!destinationUrl) {
+    const promptLower = instruction.toLowerCase();
+    const explicitUrlMatch = instruction.match(/https?:\/\/[^\s]+/i);
+    if (explicitUrlMatch) {
+      destinationUrl = explicitUrlMatch[0];
+    } else if (/irctc|train|railway|\bpnr\b/i.test(promptLower)) {
+      destinationUrl = 'https://www.irctc.co.in/nget/train-search';
+    } else if (/github\.com|\bgithub\b|\brepo\b|\brepository\b/i.test(promptLower)) {
+      destinationUrl = 'https://github.com';
+    } else if (/\b(?:pdf|word|ilovepdf|merge|split|compress|convert)\b/i.test(promptLower)) {
+      if (/pdf\s+to\s+word|word\s+to\s+pdf|convert\s+pdf/i.test(promptLower)) {
+        destinationUrl = 'https://www.ilovepdf.com/pdf_to_word';
+      } else if (/merge/i.test(promptLower)) {
+        destinationUrl = 'https://www.ilovepdf.com/merge_pdf';
+      } else if (/split/i.test(promptLower)) {
+        destinationUrl = 'https://www.ilovepdf.com/split_pdf';
+      } else if (/compress/i.test(promptLower)) {
+        destinationUrl = 'https://www.ilovepdf.com/compress_pdf';
+      } else {
+        destinationUrl = 'https://www.ilovepdf.com';
+      }
+    } else if (/\bmakemytrip\b|\bflights?\b|\bhotels?\b/i.test(promptLower)) {
+      destinationUrl = 'https://www.makemytrip.com';
+    } else if (/\bbooks to scrape\b/i.test(promptLower)) {
+      destinationUrl = 'http://books.toscrape.com';
+    } else if (/\bquotes to scrape\b/i.test(promptLower)) {
+      destinationUrl = 'http://quotes.toscrape.com';
+    } else if (/\bwikipedia\b/i.test(promptLower)) {
+      destinationUrl = 'https://www.wikipedia.org';
+    }
+  }
+
   let activeTabId: number;
   if (tabId) {
     activeTabId = tabId;
@@ -432,7 +491,47 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
     }
     activeTabId = tab.id;
   }
+
+  // Ensure activeTabId is NEVER the Judges Console dashboard or internal extension URL
+  let currentTab = await chrome.tabs.get(activeTabId).catch(() => null);
+  let currentUrl = (currentTab?.url || '').trim().toLowerCase();
+  const isDashboardTab = currentUrl.includes('localhost:5173') || currentUrl.includes('127.0.0.1:5173') || currentUrl.startsWith('chrome-extension://');
+
+  if (isDashboardTab) {
+    const allTabs = await chrome.tabs.query({});
+    const targetCandidate = allTabs.find((t) => {
+      const u = (t.url || '').toLowerCase();
+      if (destinationUrl) {
+        try {
+          const host = new URL(destinationUrl).hostname;
+          if (u.includes(host)) return true;
+        } catch {}
+      }
+      return false;
+    }) || allTabs.find((t) => {
+      const u = (t.url || '').toLowerCase();
+      return u && !u.includes('localhost:5173') && !u.includes('127.0.0.1:5173') && !u.startsWith('chrome://') && !u.startsWith('chrome-extension://');
+    });
+
+    if (targetCandidate && targetCandidate.id) {
+      activeTabId = targetCandidate.id;
+      currentTab = targetCandidate;
+      currentUrl = (targetCandidate.url || '').trim().toLowerCase();
+    } else {
+      const newTab = await chrome.tabs.create({ url: destinationUrl || 'https://github.com', active: true });
+      if (newTab.id) {
+        activeTabId = newTab.id;
+        currentTab = newTab;
+        currentUrl = (newTab.url || '').trim().toLowerCase();
+        await waitForTabToSettle(activeTabId, 10000);
+      }
+    }
+  }
+
   currentActiveTabId = activeTabId;
+  if (!currentTab?.active && activeTabId) {
+    await chrome.tabs.update(activeTabId, { active: true }).catch(() => {});
+  }
 
   try {
     // Register session on backend (idempotent)
@@ -443,8 +542,6 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
     }).catch(err => console.warn('[Background] Server session warning:', err));
 
     // Detect if current tab is restricted, empty, or not the requested site
-    const currentTab = await chrome.tabs.get(activeTabId).catch(() => null);
-    const currentUrl = (currentTab?.url || '').trim().toLowerCase();
     const isRestrictedUrl =
       !currentUrl ||
       currentUrl.startsWith('chrome://') ||
@@ -453,43 +550,11 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       currentUrl === 'about:blank' ||
       currentUrl.startsWith('data:');
 
-    // Determine target URL: explicit targetUrl OR inferred from user instruction
-    let destinationUrl = targetUrl;
-    if (!destinationUrl) {
-      const promptLower = instruction.toLowerCase();
-      const explicitUrlMatch = instruction.match(/https?:\/\/[^\s]+/i);
-      if (explicitUrlMatch) {
-        destinationUrl = explicitUrlMatch[0];
-      } else if (/irctc|train|railway|\bpnr\b/i.test(promptLower)) {
-        destinationUrl = 'https://www.irctc.co.in/nget/train-search';
-      } else if (/github\.com|\bgithub\b|\brepo\b|\brepository\b/i.test(promptLower) && (isRestrictedUrl || !currentUrl.includes('github.com'))) {
-        destinationUrl = 'https://github.com';
-      } else if (/\b(?:pdf|word|ilovepdf|merge|split|compress|convert)\b/i.test(promptLower) && (isRestrictedUrl || !currentUrl.includes('ilovepdf.com'))) {
-        if (/pdf\s+to\s+word|word\s+to\s+pdf|convert\s+pdf/i.test(promptLower)) {
-          destinationUrl = 'https://www.ilovepdf.com/pdf_to_word';
-        } else if (/merge/i.test(promptLower)) {
-          destinationUrl = 'https://www.ilovepdf.com/merge_pdf';
-        } else if (/split/i.test(promptLower)) {
-          destinationUrl = 'https://www.ilovepdf.com/split_pdf';
-        } else if (/compress/i.test(promptLower)) {
-          destinationUrl = 'https://www.ilovepdf.com/compress_pdf';
-        } else {
-          destinationUrl = 'https://www.ilovepdf.com';
-        }
-      } else if (/\bmakemytrip\b|\bflights?\b|\bhotels?\b/i.test(promptLower) && (isRestrictedUrl || !currentUrl.includes('makemytrip.com'))) {
-        destinationUrl = 'https://www.makemytrip.com';
-      } else if (/\bbooks to scrape\b/i.test(promptLower) && isRestrictedUrl) {
-        destinationUrl = 'http://books.toscrape.com';
-      } else if (/\bquotes to scrape\b/i.test(promptLower) && isRestrictedUrl) {
-        destinationUrl = 'http://quotes.toscrape.com';
-      } else if (/\bwikipedia\b/i.test(promptLower) && isRestrictedUrl) {
-        destinationUrl = 'https://www.wikipedia.org';
-      }
-    }
-
     if (destinationUrl) {
       const needsNav = isRestrictedUrl || !currentUrl.startsWith(destinationUrl.replace(/\/$/, ''));
       if (needsNav) {
+        const domain = getDomainFromUrl(destinationUrl);
+        broadcastToAll({ type: 'SPEAK_ACTION_STATUS', text: `Navigating to ${domain}.`, actionType: 'navigate' });
         broadcastChatMessage({ kind: 'status', text: `🌐 Navigating to ${destinationUrl}...` });
         emitTraceEvent('NAVIGATION', `Navigating to ${destinationUrl}`, 0);
         setTaskState('WAITING_FOR_PAGE');
@@ -497,6 +562,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
         await waitForTabToSettle(activeTabId, 10000);
       }
     } else if (isRestrictedUrl) {
+      broadcastToAll({ type: 'SPEAK_ACTION_STATUS', text: 'Navigating to google.com.', actionType: 'navigate' });
       broadcastChatMessage({ kind: 'status', text: '🌐 Opening search to locate requested service...' });
       await chrome.tabs.update(activeTabId, { url: 'https://www.google.com' });
       setTaskState('WAITING_FOR_PAGE');
@@ -544,27 +610,25 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
         curHasModal = Boolean(modalCheck?.[0]?.result);
       } catch {}
 
-      const isNewPage = curUrl !== lastCapturedUrl;
-      const isNewPopup = curHasModal && !lastHasModal;
-      const shouldCaptureAndMask = stepNum === 1 || isNewPage || isNewPopup || !cachedSanitizedScreenshot;
-
       // STEP 1: SCANNING (Automatic page perception & capture)
       setTaskState('SCANNING');
       emitTraceEvent('SCAN_STARTED', `Scanning tab #${activeTabId} viewport and DOM`, stepNum);
       broadcastChatMessage({ kind: 'status', text: '🔍 Scanning page...' });
 
-      // Capture screenshot ONLY when new page opens or new popup opens
-      let screenshot = cachedScreenshot;
-      if (shouldCaptureAndMask) {
-        try {
-          const freshShot = await captureTabScreenshot(activeTabId);
-          if (freshShot) {
-            screenshot = freshShot;
-            cachedScreenshot = freshShot;
-          }
-        } catch (capErr) {
-          console.warn('[Background] Screen capture warning:', capErr);
+      // Always capture a fresh screenshot of the target tab for every step
+      let screenshot: string | undefined = undefined;
+      try {
+        screenshot = await captureTabScreenshot(activeTabId);
+        if (screenshot) {
+          cachedScreenshot = screenshot;
         }
+      } catch (capErr) {
+        console.warn('[Background] Screen capture warning:', capErr);
+      }
+
+      // If fresh capture failed, fall back to cached
+      if (!screenshot && cachedScreenshot) {
+        screenshot = cachedScreenshot;
       }
 
       // STEP 2: VISION PROCESSING (Local YOLOS-Tiny on WebGPU/WASM)
@@ -574,7 +638,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
 
       const analysisResult = await sendMessageToTab(activeTabId, {
         type: 'ANALYZE_PAGE',
-        forceRefresh: shouldCaptureAndMask,
+        forceRefresh: true,
         screenshot,
       });
 
@@ -624,9 +688,9 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
 
       emitTraceEvent('SANITIZED_CONTEXT_CREATED', `Sanitized context prepared: ${context.elements?.length || 0} elements, redacted preview`, stepNum);
 
-      // Surface sanitized screenshot preview in chat feed ONLY when new page or popup opens
+      // Surface sanitized screenshot preview in chat feed
       const screenshotToShow = context.sanitizedScreenshot || context.screenshot || screenshot || cachedSanitizedScreenshot;
-      if (screenshotToShow && shouldCaptureAndMask) {
+      if (screenshotToShow) {
         cachedSanitizedScreenshot = screenshotToShow;
         lastCapturedUrl = curUrl;
         lastHasModal = curHasModal;
@@ -809,6 +873,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
             kind: 'error',
             text: action.reason || "I couldn't confidently find the requested element on this page.",
           });
+          broadcastToAll({ type: 'SPEAK_ACTION_STATUS', text: "I couldn't complete that action.", actionType: 'error' });
           // Set back to IDLE so user can prompt again or rescan
           setTaskState('IDLE');
           return;
@@ -822,6 +887,10 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
           text: doneReason,
           actionPill: 'DONE 100%',
         });
+        const spokenDone = getSafeSpokenActionMessage(action);
+        if (spokenDone) {
+          broadcastToAll({ type: 'SPEAK_ACTION_STATUS', text: spokenDone, actionType: 'done' });
+        }
         setTaskState('COMPLETED');
         broadcastTaskDone(doneReason);
         await delay(500);
@@ -837,6 +906,10 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
           kind: 'assistant',
           text: promptText,
         });
+        const spokenAsk = getSafeSpokenActionMessage(action, targetFriendlyName);
+        if (spokenAsk) {
+          broadcastToAll({ type: 'SPEAK_ACTION_STATUS', text: spokenAsk, actionType: 'ask_user' });
+        }
         const userVal = await requestUserInput(promptText, `ask-${stepNum}`);
         const userSummary = userVal && userVal.trim() ? userVal.trim() : 'I have entered the required details on the page.';
         currentTask.conversationHistory.push({ role: 'assistant', text: promptText });
@@ -874,6 +947,10 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
           actionId: confirmActionId,
           actionPill,
         });
+        const spokenConfirm = targetFriendlyName
+          ? `Would you like me to click ${targetFriendlyName}?`
+          : 'Waiting for your confirmation.';
+        broadcastToAll({ type: 'SPEAK_ACTION_STATUS', text: spokenConfirm, actionType: 'ask_user' });
 
         const approved = await requestActionApproval(action, confirmActionId, confidence);
         if (!approved) {
@@ -894,6 +971,11 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
         kind: 'status',
         text: `▶ Executing ${action.action.toUpperCase()} on ${displayTarget}...`,
       });
+
+      const spokenAction = getSafeSpokenActionMessage(action, targetFriendlyName);
+      if (spokenAction) {
+        broadcastToAll({ type: 'SPEAK_ACTION_STATUS', text: spokenAction, actionType: action.action });
+      }
 
       let execResult: any;
       if (action.action === 'navigate' && action.url) {
@@ -917,6 +999,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
           kind: 'error',
           text: `Action failed: ${execResult?.error ?? 'Target element was not clickable or interactive'}. Would you like to rescan?`,
         });
+        broadcastToAll({ type: 'SPEAK_ACTION_STATUS', text: "I couldn't complete that action.", actionType: 'error' });
         setTaskState('IDLE');
         return;
       }
@@ -1238,7 +1321,16 @@ async function waitForTabToSettle(tabId: number, maxWaitMs = 8000): Promise<void
         ]).catch(() => null);
 
         if (ping) {
-          // Content script is alive and responding!
+          // Content script is alive and responding! Ensure layout paint frame before returning
+          try {
+            await chrome.scripting.executeScript({
+              target: { tabId },
+              func: () => new Promise<void>((res) => {
+                requestAnimationFrame(() => requestAnimationFrame(() => res()));
+                setTimeout(res, 400);
+              }),
+            }).catch(() => {});
+          } catch {}
           return;
         }
       } catch {}
@@ -1263,20 +1355,48 @@ function generateId(): string {
 }
 
 /**
- * Capture a screenshot of the active tab.
+ * Capture a screenshot of the target tab.
+ * Ensures the target tab is active in its window before capture so Chrome MV3
+ * captureVisibleTab captures the exact target viewport, never the Judges Console or other tabs.
  * Returns a base64 data URL, or undefined if capture fails.
- * Used to feed the vision pipeline (OCR + face detection).
  */
 async function captureTabScreenshot(tabId: number): Promise<string | undefined> {
   try {
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (tab && typeof tab.windowId === 'number' && tab.windowId >= 0) {
+    let tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab) return undefined;
+
+    // If tab is the dashboard or internal URL, attempt to locate the actual target web tab
+    const tabUrl = (tab.url || '').toLowerCase();
+    if (
+      tabUrl.includes('localhost:5173') ||
+      tabUrl.includes('127.0.0.1:5173') ||
+      tabUrl.startsWith('chrome://') ||
+      tabUrl.startsWith('chrome-extension://')
+    ) {
+      const allTabs = await chrome.tabs.query({});
+      const targetTab = allTabs.find((t) => {
+        const u = (t.url || '').toLowerCase();
+        return u && !u.includes('localhost:5173') && !u.includes('127.0.0.1:5173') && !u.startsWith('chrome://') && !u.startsWith('chrome-extension://');
+      });
+      if (targetTab && targetTab.id) {
+        tab = targetTab;
+      } else {
+        console.warn('[Background] Refusing to capture internal/dashboard tab and no target found:', tab.url);
+        return undefined;
+      }
+    }
+
+    const targetWinId = typeof tab.windowId === 'number' && tab.windowId >= 0 ? tab.windowId : undefined;
+
+    // Attempt 1: Capture with windowId (without stealing focus)
+    if (typeof targetWinId === 'number') {
       const dataUrl = await new Promise<string | undefined>((resolve) => {
-        chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 }, (url) => {
+        chrome.tabs.captureVisibleTab(targetWinId, { format: 'jpeg', quality: 75 }, (url) => {
           if (chrome.runtime.lastError || !url) {
-            chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 70 }, (fallback) => {
-              resolve(fallback || undefined);
-            });
+            if (chrome.runtime.lastError) {
+              console.warn('[Background] captureVisibleTab with windowId notice:', chrome.runtime.lastError.message);
+            }
+            resolve(undefined);
           } else {
             resolve(url);
           }
@@ -1284,20 +1404,37 @@ async function captureTabScreenshot(tabId: number): Promise<string | undefined> 
       });
       if (dataUrl) return dataUrl;
     }
+
+    // Attempt 2: Fallback capture without windowId (captures currently active window)
+    const fallbackUrl = await new Promise<string | undefined>((resolve) => {
+      chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 75 }, (url) => {
+        if (chrome.runtime.lastError || !url) {
+          if (chrome.runtime.lastError) {
+            console.warn('[Background] captureVisibleTab fallback notice:', chrome.runtime.lastError.message);
+          }
+          resolve(undefined);
+        } else {
+          resolve(url);
+        }
+      });
+    });
+    if (fallbackUrl) return fallbackUrl;
+
+    // Attempt 3: Small delay and one final retry (without stealing focus)
+    await delay(150);
+    if (typeof targetWinId === 'number') {
+      const retryUrl = await new Promise<string | undefined>((resolve) => {
+        chrome.tabs.captureVisibleTab(targetWinId, { format: 'jpeg', quality: 75 }, (url) => {
+          resolve(url || undefined);
+        });
+      });
+      if (retryUrl) return retryUrl;
+    }
   } catch (err) {
     console.warn('[Background] Screen capture warning:', err);
   }
 
-  // Fallback: capture without windowId
-  return new Promise<string | undefined>((resolve) => {
-    try {
-      chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 70 }, (fallback) => {
-        resolve(fallback || undefined);
-      });
-    } catch {
-      resolve(undefined);
-    }
-  });
+  return undefined;
 }
 
 /** Send timing metrics to the server (fire-and-forget). */

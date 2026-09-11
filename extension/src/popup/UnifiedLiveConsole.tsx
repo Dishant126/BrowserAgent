@@ -15,6 +15,11 @@ import type {
   ChatMessage,
   TraceEvent,
 } from '../utils/types';
+import {
+  SpeechRecognitionManager,
+  isSpeechRecognitionSupported,
+} from '../utils/speech-recognition';
+import { voiceOutputManager } from '../utils/speech-synthesis';
 
 export interface StepInfo {
   step: number;
@@ -460,9 +465,22 @@ export function UnifiedLiveConsole() {
   const [showInspectorDrawer, setShowInspectorDrawer] = useState<boolean>(false);
   const [expandedImage, setExpandedImage] = useState<string | null>(null);
 
+  // Voice Input States
+  const [isListening, setIsListening] = useState(false);
+  const [speechError, setSpeechError] = useState<string | null>(null);
+  const [isVoiceSupported, setIsVoiceSupported] = useState(true);
+  const [isVoiceOutputEnabled, setIsVoiceOutputEnabled] = useState(true);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const speechManagerRef = useRef<SpeechRecognitionManager | null>(null);
+  const basePromptRef = useRef<string>('');
+
   const chatScrollRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    try {
+      chrome.storage.session?.set({ popupOpen: true }).catch(() => {});
+    } catch {}
+
     chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (res) => {
       if (!res) return;
       if (res.taskState) setTaskState(res.taskState);
@@ -476,11 +494,20 @@ export function UnifiedLiveConsole() {
       }
     });
 
-    chrome.storage.local.get(['auditLog', 'autoShowFloatingPanel'], (r) => {
+    chrome.storage.local.get(['auditLog', 'autoShowFloatingPanel', 'voiceOutputEnabled'], (r) => {
       if (r.auditLog && r.auditLog.length > 0) {
         setAuditEvents(r.auditLog.slice(-15).reverse());
       }
       setAutoShowPanel(!!r.autoShowFloatingPanel);
+      if (r && typeof r.voiceOutputEnabled === 'boolean') {
+        setIsVoiceOutputEnabled(r.voiceOutputEnabled);
+        voiceOutputManager.setEnabled(r.voiceOutputEnabled);
+      }
+    });
+
+    const unsubVoice = voiceOutputManager.subscribe((speaking, enabled) => {
+      setIsSpeaking(speaking);
+      setIsVoiceOutputEnabled(enabled);
     });
 
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
@@ -547,19 +574,150 @@ export function UnifiedLiveConsole() {
       if (msg.type === 'SITE_STATUS') {
         setSiteStatus(msg.siteStatus);
       }
+
+      if (msg.type === 'VOICE_STATE_CHANGE') {
+        setIsListening(!!msg.isListening);
+      }
+
+      if (msg.type === 'VOICE_TRANSCRIPT') {
+        const base = basePromptRef.current.trim();
+        const combined = base ? `${base} ${msg.transcript}` : msg.transcript;
+        setPromptText(combined);
+        setSpeechError(null);
+      }
+
+      if (msg.type === 'VOICE_ERROR') {
+        setIsListening(false);
+        setSpeechError(msg.errorMsg || 'Voice input error.');
+      }
+
+      if (msg.type === 'SPEAK_ACTION_STATUS' && msg.text) {
+        voiceOutputManager.speak(msg.text);
+      }
+
+      if (msg.type === 'VOICE_OUTPUT_TOGGLED' && typeof msg.enabled === 'boolean') {
+        setIsVoiceOutputEnabled(msg.enabled);
+        voiceOutputManager.setEnabled(msg.enabled);
+      }
     };
 
     chrome.runtime.onMessage.addListener(listener);
-    return () => chrome.runtime.onMessage.removeListener(listener);
+    return () => {
+      try {
+        chrome.storage.session?.set({ popupOpen: false }).catch(() => {});
+      } catch {}
+      unsubVoice();
+      chrome.runtime.onMessage.removeListener(listener);
+    };
   }, []);
 
   useEffect(() => {
     chatScrollRef.current?.scrollTo({ top: chatScrollRef.current.scrollHeight, behavior: 'smooth' });
   }, [chatMessages, showInspectorDrawer]);
 
+  useEffect(() => {
+    setIsVoiceSupported(isSpeechRecognitionSupported());
+    speechManagerRef.current = new SpeechRecognitionManager();
+    return () => {
+      speechManagerRef.current?.abort();
+    };
+  }, []);
+
+  const toggleVoiceInput = useCallback(async () => {
+    if (isListening) {
+      setIsListening(false);
+      speechManagerRef.current?.stop();
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        const tabId = tabs[0]?.id;
+        if (tabId) {
+          chrome.tabs.sendMessage(tabId, { type: 'STOP_VOICE_INPUT' }, () => {});
+        }
+      });
+      return;
+    }
+
+    setSpeechError(null);
+    basePromptRef.current = promptText;
+
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tab = tabs[0];
+      const tabId = tab?.id;
+      const url = tab?.url || '';
+
+      const isInternal = !tabId || url.startsWith('chrome://') || url.startsWith('chrome-extension://') || url.startsWith('edge://') || url.startsWith('about:');
+
+      if (isInternal) {
+        // Internal page (e.g. newtab) — attempt local recognition
+        const started = speechManagerRef.current?.start({
+          onStateChange: (listening) => setIsListening(listening),
+          onTranscript: (transcript) => {
+            const base = basePromptRef.current.trim();
+            setPromptText(base ? `${base} ${transcript}` : transcript);
+            setSpeechError(null);
+          },
+          onError: (errorMsg, errorCode) => {
+            setIsListening(false);
+            if (errorCode === 'not-allowed' || errorCode === 'service-not-allowed') {
+              setSpeechError('Microphone prompt requires an active website. Please open a website (e.g. Wikipedia or Google).');
+            } else {
+              setSpeechError(errorMsg);
+            }
+          }
+        });
+        if (started) setIsListening(true);
+        return;
+      }
+
+      // Website tab — delegate to content script to trigger Chrome's native pop-up directly!
+      chrome.tabs.sendMessage(tabId, { type: 'START_VOICE_INPUT' }, (res) => {
+        if (chrome.runtime.lastError || !res?.ok) {
+          try {
+            chrome.scripting.executeScript(
+              { target: { tabId }, files: ['content.js'] },
+              () => {
+                chrome.tabs.sendMessage(tabId, { type: 'START_VOICE_INPUT' }, (res2) => {
+                  if (res2?.ok) {
+                    setIsListening(true);
+                  }
+                });
+              }
+            );
+          } catch {
+            setSpeechError('Could not start voice input on this tab.');
+          }
+        } else {
+          setIsListening(true);
+        }
+      });
+    });
+  }, [isListening, promptText]);
+
+  const toggleVoiceOutput = useCallback(() => {
+    const next = !isVoiceOutputEnabled;
+    setIsVoiceOutputEnabled(next);
+    voiceOutputManager.setEnabled(next);
+    chrome.runtime.sendMessage({ type: 'VOICE_OUTPUT_TOGGLED', enabled: next }).catch(() => {});
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+      const tabId = tabs[0]?.id;
+      if (tabId) {
+        chrome.tabs.sendMessage(tabId, { type: 'VOICE_OUTPUT_TOGGLED', enabled: next }).catch(() => {});
+      }
+    });
+  }, [isVoiceOutputEnabled]);
+
   const isAwaitingUserInput = taskState === 'USER_REQUIRED' || taskState === 'WAITING_USER';
 
   const sendPrompt = useCallback(async () => {
+    if (isListening) {
+      speechManagerRef.current?.stop();
+      setIsListening(false);
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        const tabId = tabs[0]?.id;
+        if (tabId) {
+          chrome.tabs.sendMessage(tabId, { type: 'STOP_VOICE_INPUT' }, () => {});
+        }
+      });
+    }
     const text = promptText.trim();
     if (!text || (running && !isAwaitingUserInput)) return;
     setPromptText('');
@@ -624,7 +782,21 @@ export function UnifiedLiveConsole() {
     chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
       const tabId = tabs[0]?.id;
       if (tabId) {
-        chrome.tabs.sendMessage(tabId, { type: 'TOGGLE_FLOATING_PANEL', show: true });
+        chrome.tabs.sendMessage(tabId, { type: 'TOGGLE_FLOATING_PANEL', show: true }, () => {
+          if (chrome.runtime.lastError) {
+            try {
+              chrome.scripting.executeScript(
+                {
+                  target: { tabId },
+                  files: ['content.js'],
+                },
+                () => {
+                  chrome.tabs.sendMessage(tabId, { type: 'TOGGLE_FLOATING_PANEL', show: true }, () => {});
+                }
+              );
+            } catch {}
+          }
+        });
       }
     });
     window.close();
@@ -1145,11 +1317,45 @@ export function UnifiedLiveConsole() {
         )}
       </div>
 
-      {/* 6. Prompt Input Bar */}
+      {/* 6. Voice Input Error Banner (if any) */}
+      {speechError && (
+        <div style={{
+          padding: '4px 10px',
+          background: 'rgba(239, 68, 68, 0.15)',
+          borderTop: '1px solid rgba(239, 68, 68, 0.3)',
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          fontSize: 9.5,
+          color: '#fca5a5',
+          flexShrink: 0,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, overflow: 'hidden' }}>
+            <span>⚠️</span>
+            <span style={{ textOverflow: 'ellipsis', overflow: 'hidden', whiteSpace: 'nowrap' }}>{speechError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setSpeechError(null)}
+            style={{
+              background: 'transparent',
+              color: '#94a3b8',
+              border: 'none',
+              fontSize: 11,
+              cursor: 'pointer',
+              lineHeight: 1,
+            }}
+          >
+            ×
+          </button>
+        </div>
+      )}
+
+      {/* 7. Prompt Input Bar */}
       <div style={{
         padding: '6px 8px',
         background: '#081324',
-        borderTop: '1px solid #16253d',
+        borderTop: speechError ? 'none' : '1px solid #16253d',
         display: 'flex',
         gap: 6,
         alignItems: 'center',
@@ -1161,7 +1367,9 @@ export function UnifiedLiveConsole() {
           onChange={(e) => setPromptText(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && sendPrompt()}
           placeholder={
-            taskState === 'USER_REQUIRED'
+            isListening
+              ? '🎙️ Listening... Speak your instruction now...'
+              : taskState === 'USER_REQUIRED'
               ? 'Enter required details or answer here...'
               : taskState === 'WAITING_USER'
               ? 'Select file in browser or type instruction...'
@@ -1170,17 +1378,67 @@ export function UnifiedLiveConsole() {
           disabled={running && !isAwaitingUserInput}
           style={{
             flex: 1,
-            background: isAwaitingUserInput ? '#0c2240' : '#050d1a',
-            border: isAwaitingUserInput ? '1px solid #38bdf8' : '1px solid #1e3a5f',
+            background: isListening ? '#1a0b12' : isAwaitingUserInput ? '#0c2240' : '#050d1a',
+            border: isListening ? '1px solid #f87171' : isAwaitingUserInput ? '1px solid #38bdf8' : '1px solid #1e3a5f',
             borderRadius: 6,
             padding: '7px 10px',
             color: '#ffffff',
             fontSize: 10.5,
             outline: 'none',
             opacity: (running && !isAwaitingUserInput) ? 0.6 : 1,
-            boxShadow: isAwaitingUserInput ? '0 0 10px rgba(56,189,248,0.25)' : 'none',
+            boxShadow: isListening ? '0 0 10px rgba(239,68,68,0.3)' : isAwaitingUserInput ? '0 0 10px rgba(56,189,248,0.25)' : 'none',
+            transition: 'all 0.2s ease',
           }}
         />
+
+        {/* Voice Input Microphone Button */}
+        <button
+          type="button"
+          onClick={toggleVoiceInput}
+          disabled={!isVoiceSupported || (running && !isAwaitingUserInput)}
+          title={
+            !isVoiceSupported
+              ? 'Voice input is not supported in this browser'
+              : isListening
+              ? 'Listening... Click to stop voice input'
+              : 'Voice Input (dictate prompt)'
+          }
+          style={{
+            background: isListening
+              ? 'linear-gradient(135deg, #ef4444, #b91c1c)'
+              : 'linear-gradient(135deg, #0f1f38, #0a1526)',
+            color: isListening ? '#ffffff' : '#38bdf8',
+            border: isListening ? '1px solid #f87171' : '1px solid #1e3a5f',
+            borderRadius: 6,
+            padding: isListening ? '7px 8px' : '7px 9px',
+            fontSize: 11,
+            cursor: (!isVoiceSupported || (running && !isAwaitingUserInput)) ? 'not-allowed' : 'pointer',
+            opacity: (!isVoiceSupported || (running && !isAwaitingUserInput)) ? 0.4 : 1,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            gap: 4,
+            boxShadow: isListening ? '0 0 12px rgba(239, 68, 68, 0.5)' : 'none',
+            transition: 'all 0.15s ease',
+            flexShrink: 0,
+          }}
+        >
+          {isListening ? (
+            <>
+              <span style={{
+                width: 7,
+                height: 7,
+                borderRadius: '50%',
+                background: '#ffffff',
+                display: 'inline-block',
+                boxShadow: '0 0 5px #ffffff',
+              }} />
+              <span style={{ fontSize: 9, fontWeight: 700, color: '#ffffff' }}>Stop</span>
+            </>
+          ) : (
+            '🎙️'
+          )}
+        </button>
         {running && !isAwaitingUserInput ? (
           <button
             onClick={stopTask}
@@ -1257,7 +1515,28 @@ export function UnifiedLiveConsole() {
             Launch Floating Panel
           </button>
         </div>
-        <div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <button
+            onClick={toggleVoiceOutput}
+            title={isVoiceOutputEnabled ? "Voice Output is ON. Click to mute." : "Voice Output is OFF. Click to unmute."}
+            style={{
+              background: isVoiceOutputEnabled ? (isSpeaking ? '#0c2d48' : '#0e2338') : '#1c1924',
+              color: isVoiceOutputEnabled ? (isSpeaking ? '#38bdf8' : '#22d3ee') : '#94a3b8',
+              border: isVoiceOutputEnabled ? (isSpeaking ? '1px solid #38bdf8' : '1px solid #0284c7') : '1px solid #334155',
+              borderRadius: 4,
+              padding: '2px 7px',
+              fontSize: 8.5,
+              fontWeight: 700,
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              gap: 4,
+              transition: 'all 0.15s ease',
+            }}
+          >
+            <span>{isVoiceOutputEnabled ? (isSpeaking ? '🔊' : '🔊') : '🔇'}</span>
+            <span>{isVoiceOutputEnabled ? (isSpeaking ? 'Speaking...' : 'Voice Output ON') : 'Voice Output OFF'}</span>
+          </button>
           <label style={{ fontSize: 9, color: '#64748b', display: 'flex', alignItems: 'center', gap: 4, cursor: 'pointer' }}>
             <input
               type="checkbox"
