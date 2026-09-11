@@ -3,7 +3,7 @@
  */
 import type { PIIEntity, UIElement, BoundingBox } from '../utils/types';
 
-const SENSITIVITY_COLORS: Record<string, string> = {
+export const SENSITIVITY_COLORS: Record<string, string> = {
   CRITICAL: '#dc2626', HIGH: '#f57c00', MEDIUM: '#ca8a04', LOW: '#2563eb',
 };
 

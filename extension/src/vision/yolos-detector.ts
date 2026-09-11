@@ -57,10 +57,47 @@ const PII_LABEL_MAP: Record<string, { piiType: PIIType; sensitivity: 'CRITICAL' 
 let _pipeline: any = null;
 let _loading = false;
 let _loadError: Error | null = null;
+let _lastErrorTime = 0;
 let _backend: YOLOSBackend = 'unavailable';
 const _waiters: Array<() => void> = [];
 
-// ── MODEL INITIALIZATION ──────────────────────────────────────────────────────
+/**
+ * Test whether the host page's Content Security Policy permits WebAssembly compilation.
+ * Third-party websites with strict CSPs (such as GitHub) block WebAssembly.instantiate()
+ * inside content scripts. Checking first prevents noisy unhandled Emscripten abort errors.
+ */
+function isWasmSupportedUnderCurrentCSP(): boolean {
+  try {
+    const minimalWasm = new Uint8Array([0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+    new WebAssembly.Module(minimalWasm);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+let _huggingFaceAccessible: boolean | null = null;
+
+/**
+ * Check if the current page environment allows network connections to HuggingFace.
+ * Sites like GitHub block connect-src to external CDNs. Probing first prevents 25-second timeouts.
+ */
+async function canConnectToHuggingFace(): Promise<boolean> {
+  if (_huggingFaceAccessible !== null) return _huggingFaceAccessible;
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1200);
+    await fetch('https://huggingface.co/Xenova/yolos-tiny/resolve/main/config.json', {
+      method: 'HEAD',
+      signal: controller.signal,
+    });
+    clearTimeout(timeout);
+    _huggingFaceAccessible = true;
+  } catch {
+    _huggingFaceAccessible = false;
+  }
+  return _huggingFaceAccessible;
+}
 
 /**
  * Lazily initialize the YOLOS-Tiny pipeline.
@@ -69,7 +106,28 @@ const _waiters: Array<() => void> = [];
  */
 async function getPipeline(): Promise<any | null> {
   if (_pipeline) return _pipeline;
-  if (_loadError) return null;
+  // If host page CSP blocks WebAssembly, do not attempt to compile WASM/WebGPU in content script
+  if (!isWasmSupportedUnderCurrentCSP()) {
+    if (_backend !== 'unavailable') {
+      console.log('[YOLOS] Host page CSP restricts WebAssembly in content script (e.g. GitHub). Using fast on-device heuristic vision detector.');
+      _backend = 'unavailable';
+    }
+    return null;
+  }
+
+  // If host page CSP blocks network downloads from HuggingFace, fall back immediately
+  const canDownload = await canConnectToHuggingFace();
+  if (!canDownload) {
+    if (_backend !== 'unavailable') {
+      console.log('[YOLOS] External model downloads blocked by page CSP (e.g. GitHub). Using fast on-device heuristic vision detector.');
+      _backend = 'unavailable';
+    }
+    return null;
+  }
+
+  // Cool off 10s before retrying after an error, rather than locking out permanently
+  if (_loadError && Date.now() - _lastErrorTime < 10000) return null;
+  _loadError = null;
 
   if (_loading) {
     // Another call is already initializing — wait for it
@@ -90,30 +148,57 @@ async function getPipeline(): Promise<any | null> {
     // Configure WASM paths to extension's bundled WASM files (for WASM fallback)
     if (typeof chrome !== 'undefined' && chrome.runtime?.getURL) {
       try {
-        (env as any).backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('ort-wasm/');
-      } catch { /* non-critical — WebGPU doesn't need WASM paths */ }
+        if ((env as any).backends?.onnx?.wasm) {
+          (env as any).backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('ort-wasm/');
+          // Third-party pages do not provide Cross-Origin-Opener-Policy for SharedArrayBuffer,
+          // so single-threaded WASM is required in content script context.
+          (env as any).backends.onnx.wasm.numThreads = 1;
+        }
+      } catch { /* non-critical */ }
     }
 
     const hasGPU = await checkWebGPUSupport();
-    const device  = hasGPU ? 'webgpu' : 'wasm';
-    _backend = hasGPU ? 'WebGPU' : 'WASM';
+    let pipe: any = null;
 
-    console.log(`[YOLOS] Initializing YOLOS-Tiny on ${_backend}...`);
-
-    _pipeline = await pipeline(
-      'object-detection',
-      'Xenova/yolos-tiny',
-      {
-        device,
-        // fp32 dtype — quantized variants can be set to 'int8' for faster loading
-        dtype: 'fp32',
+    if (hasGPU) {
+      try {
+        _backend = 'WebGPU';
+        console.log('[YOLOS] Initializing YOLOS-Tiny on WebGPU...');
+        pipe = await pipeline(
+          'object-detection',
+          'Xenova/yolos-tiny',
+          {
+            device: 'webgpu',
+            dtype: 'fp32',
+          }
+        );
+        console.log('[YOLOS] YOLOS-Tiny ready on WebGPU');
+      } catch (gpuErr) {
+        console.warn('[YOLOS] WebGPU failed, attempting WASM fallback:', gpuErr);
+        pipe = null;
       }
-    );
+    }
 
-    console.log(`[YOLOS] YOLOS-Tiny ready on ${_backend}`);
+    if (!pipe) {
+      _backend = 'WASM';
+      console.log('[YOLOS] Initializing YOLOS-Tiny on WASM fallback...');
+      pipe = await pipeline(
+        'object-detection',
+        'Xenova/yolos-tiny',
+        {
+          device: 'wasm',
+          dtype: 'fp32',
+        }
+      );
+      console.log('[YOLOS] YOLOS-Tiny ready on WASM');
+    }
+
+    _pipeline = pipe;
+    _loadError = null;
   } catch (err) {
     console.warn('[YOLOS] Initialization failed — falling back to existing heuristics:', err);
     _loadError = err as Error;
+    _lastErrorTime = Date.now();
     _pipeline  = null;
   } finally {
     _loading = false;
@@ -171,33 +256,61 @@ export async function runYOLOSDetection(
   const detectedLabels: string[] = [];
 
   try {
-    const pipe = await Promise.race([
-      getPipeline(),
-      new Promise<null>((resolve) => setTimeout(() => {
-        console.warn('[YOLOS] Pipeline initialization timed out (25000ms limit on cold start)');
-        resolve(null);
-      }, 25000)),
-    ]);
+    // 1. Primary path: Offscreen document with pre-bundled local Xenova/yolos-tiny model (immune to page CSP)
+    let detections: YOLOSDetection[] = [];
+    let backendUsed: YOLOSBackend = 'unavailable';
 
-    if (!pipe) {
-      const stats: VisionInferenceStats = {
-        model: 'Xenova/yolos-tiny',
-        backend: _backend,
-        inferenceMs: Math.round(performance.now() - t0),
-        detectionCount: 0,
-        labels: [],
-      };
-      _latestStats = stats;
-      return { entities: [], stats };
+    if (typeof chrome !== 'undefined' && chrome.runtime?.sendMessage) {
+      try {
+        const offscreenResp = await new Promise<any>((resolve) => {
+          const timeout = setTimeout(() => resolve(null), 4000);
+          chrome.runtime.sendMessage({
+            type: 'VIT_INFERENCE',
+            imageData: canvas.toDataURL('image/jpeg', 0.85),
+            threshold: scoreThreshold,
+          }, (resp) => {
+            clearTimeout(timeout);
+            const err = chrome.runtime.lastError;
+            if (err || !resp?.ok) resolve(null);
+            else resolve(resp);
+          });
+        });
+
+        if (offscreenResp && Array.isArray(offscreenResp.detections)) {
+          detections = offscreenResp.detections.map((d: any) => ({
+            label: d.label,
+            score: d.score,
+            box: {
+              xmin: d.bbox.x,
+              ymin: d.bbox.y,
+              xmax: d.bbox.x + d.bbox.width,
+              ymax: d.bbox.y + d.bbox.height,
+            },
+          }));
+          backendUsed = 'WebGPU';
+          _backend = 'WebGPU';
+          console.log(`[YOLOS] Offscreen bundled model detected ${detections.length} objects`);
+        }
+      } catch { /* fallback to local pipeline */ }
     }
 
-    // Convert canvas to JPEG data URL for the pipeline
-    const imageDataUrl = canvas.toDataURL('image/jpeg', 0.85);
-
-    const detections: YOLOSDetection[] = await Promise.race([
-      pipe(imageDataUrl, { threshold: scoreThreshold }),
-      new Promise<YOLOSDetection[]>((resolve) => setTimeout(() => resolve([]), 6000)),
-    ]);
+    // 2. Fallback: Local pipeline if offscreen didn't run
+    if (detections.length === 0) {
+      const pipe = await Promise.race([
+        getPipeline(),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 2000)),
+      ]);
+      if (pipe) {
+        const localDets: YOLOSDetection[] = await Promise.race([
+          pipe(canvas.toDataURL('image/jpeg', 0.85), { threshold: scoreThreshold }),
+          new Promise<YOLOSDetection[]>((resolve) => setTimeout(() => resolve([]), 4000)),
+        ]);
+        if (localDets && localDets.length > 0) {
+          detections = localDets;
+          backendUsed = _backend;
+        }
+      }
+    }
 
     const latencyMs = Math.round(performance.now() - t0);
 

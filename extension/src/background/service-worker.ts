@@ -79,6 +79,31 @@ function broadcastToAll(msg: any) {
   }
 }
 
+let offscreenCreationPromise: Promise<void> | null = null;
+async function ensureOffscreenDocument(): Promise<void> {
+  if (typeof chrome.offscreen === 'undefined') return;
+  if (await chrome.offscreen.hasDocument?.()) return;
+  if (offscreenCreationPromise) return offscreenCreationPromise;
+
+  offscreenCreationPromise = (async () => {
+    try {
+      await chrome.offscreen.createDocument({
+        url: 'offscreen.html',
+        reasons: [chrome.offscreen.Reason.WORKERS],
+        justification: 'Run local on-device computer vision and OCR models',
+      });
+    } catch (err: any) {
+      if (!err?.message?.includes('already exists')) {
+        console.warn('[Background] Failed to create offscreen document:', err);
+      }
+    }
+  })().finally(() => {
+    offscreenCreationPromise = null;
+  });
+
+  return offscreenCreationPromise;
+}
+
 function cleanElementLabel(raw: string): string {
   if (!raw) return '';
   let s = raw.replace(/^(PDF tool link:|link:|button:|tab:|menuitem:|heading:|input:)\s*/i, '').trim();
@@ -351,8 +376,22 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
     }
 
     case 'VIT_INFERENCE': {
-      sendResponse({ ok: true, detections: [] });
-      return false;
+      (async () => {
+        try {
+          await ensureOffscreenDocument();
+          chrome.runtime.sendMessage(message, (resp) => {
+            const err = chrome.runtime.lastError;
+            if (err || !resp) {
+              sendResponse({ ok: false, error: err?.message || 'No response from offscreen worker' });
+            } else {
+              sendResponse(resp);
+            }
+          });
+        } catch (err) {
+          sendResponse({ ok: false, error: String(err) });
+        }
+      })();
+      return true;
     }
 
     case 'VERIFY_PII': {
@@ -1262,42 +1301,80 @@ function generateId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
 }
 
+let lastCaptureTime = 0;
+let lastCapturedScreenshot: string | undefined;
+let inFlightCapture: Promise<string | undefined> | null = null;
+const MIN_CAPTURE_INTERVAL_MS = 650;
+
 /**
  * Capture a screenshot of the active tab.
  * Returns a base64 data URL, or undefined if capture fails.
  * Used to feed the vision pipeline (OCR + face detection).
+ * Rate-limited to comply with Chrome's MAX_CAPTURE_VISIBLE_TAB_CALLS_PER_SECOND quota (2/sec).
  */
 async function captureTabScreenshot(tabId: number): Promise<string | undefined> {
-  try {
-    const tab = await chrome.tabs.get(tabId).catch(() => null);
-    if (tab && typeof tab.windowId === 'number' && tab.windowId >= 0) {
-      const dataUrl = await new Promise<string | undefined>((resolve) => {
-        chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 }, (url) => {
-          if (chrome.runtime.lastError || !url) {
-            chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 70 }, (fallback) => {
-              resolve(fallback || undefined);
-            });
-          } else {
-            resolve(url);
-          }
-        });
-      });
-      if (dataUrl) return dataUrl;
-    }
-  } catch (err) {
-    console.warn('[Background] Screen capture warning:', err);
+  if (inFlightCapture) {
+    return inFlightCapture;
   }
 
-  // Fallback: capture without windowId
-  return new Promise<string | undefined>((resolve) => {
-    try {
-      chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 70 }, (fallback) => {
-        resolve(fallback || undefined);
-      });
-    } catch {
-      resolve(undefined);
+  const now = Date.now();
+  const elapsed = now - lastCaptureTime;
+  if (elapsed < MIN_CAPTURE_INTERVAL_MS && lastCapturedScreenshot) {
+    return lastCapturedScreenshot;
+  }
+
+  inFlightCapture = (async () => {
+    if (elapsed < MIN_CAPTURE_INTERVAL_MS) {
+      await new Promise(r => setTimeout(r, MIN_CAPTURE_INTERVAL_MS - elapsed));
     }
+    lastCaptureTime = Date.now();
+
+    try {
+      const tab = await chrome.tabs.get(tabId).catch(() => null);
+      if (tab && typeof tab.windowId === 'number' && tab.windowId >= 0) {
+        const dataUrl = await new Promise<string | undefined>((resolve) => {
+          chrome.tabs.captureVisibleTab(tab.windowId, { format: 'jpeg', quality: 70 }, (url) => {
+            const err = chrome.runtime.lastError;
+            if (err || !url) {
+              chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 70 }, (fallback) => {
+                const fallbackErr = chrome.runtime.lastError;
+                resolve(fallback || undefined);
+              });
+            } else {
+              resolve(url);
+            }
+          });
+        });
+        if (dataUrl) {
+          lastCapturedScreenshot = dataUrl;
+          return dataUrl;
+        }
+      }
+    } catch (err) {
+      console.warn('[Background] Screen capture warning:', err);
+    }
+
+    // Fallback: capture without windowId
+    const fallbackRes = await new Promise<string | undefined>((resolve) => {
+      try {
+        chrome.tabs.captureVisibleTab({ format: 'jpeg', quality: 70 }, (fallback) => {
+          const fallbackErr = chrome.runtime.lastError;
+          resolve(fallback || undefined);
+        });
+      } catch {
+        resolve(undefined);
+      }
+    });
+
+    if (fallbackRes) {
+      lastCapturedScreenshot = fallbackRes;
+    }
+    return fallbackRes;
+  })().finally(() => {
+    inFlightCapture = null;
   });
+
+  return inFlightCapture;
 }
 
 /** Send timing metrics to the server (fire-and-forget). */

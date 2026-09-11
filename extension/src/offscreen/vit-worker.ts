@@ -62,26 +62,34 @@ async function loadModel(): Promise<void> {
     try {
       const { pipeline, env } = await import('@huggingface/transformers');
 
-      env.allowRemoteModels = true;
-      env.useBrowserCache = true;
+      // Use pre-bundled local model weights — 100% offline, zero network requests
+      env.allowLocalModels = true;
+      env.allowRemoteModels = false;
+      env.localModelPath = chrome.runtime.getURL('models');
 
-      broadcastProgress('Downloading model weights (~7MB)...', 10);
+      // Configure WASM paths
+      if ((env as any).backends?.onnx?.wasm) {
+        (env as any).backends.onnx.wasm.wasmPaths = chrome.runtime.getURL('ort-wasm/');
+        (env as any).backends.onnx.wasm.numThreads = 1;
+      }
 
-      detector = await pipeline('object-detection', MODEL_ID, {
-        progress_callback: (info: any) => {
-          if (info.status === 'downloading') {
-            const pct = info.loaded && info.total
-              ? Math.round((info.loaded / info.total) * 75) + 10
-              : 50;
-            broadcastProgress(`Downloading ${info.file || 'weights'}...`, pct);
-          } else if (info.status === 'loading') {
-            broadcastProgress('Loading into ONNX runtime...', 90);
-          }
-        },
-      });
+      broadcastProgress('Loading bundled model weights...', 30);
+
+      const loadOpts = (device: string) => ({
+        dtype: 'q8',
+        device,
+      } as any);
+
+      try {
+        detector = await (pipeline as any)('object-detection', MODEL_ID, loadOpts('webgpu'));
+        console.log('[ViT-Worker] Model ready on WebGPU:', MODEL_ID);
+      } catch (gpuErr) {
+        console.warn('[ViT-Worker] WebGPU unavailable in offscreen, using WASM:', gpuErr);
+        detector = await (pipeline as any)('object-detection', MODEL_ID, loadOpts('wasm'));
+        console.log('[ViT-Worker] Model ready on WASM:', MODEL_ID);
+      }
 
       isLoaded = true;
-      console.log('[ViT-Worker] Model ready:', MODEL_ID);
       broadcastProgress('ViT model ready ✓', 100);
     } catch (err: any) {
       console.error('[ViT-Worker] Load failed:', err);

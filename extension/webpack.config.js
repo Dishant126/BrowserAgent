@@ -9,7 +9,7 @@ module.exports = (env, argv) => {
       content:    './src/content/content.ts',
       background: './src/background/service-worker.ts',
       popup:      './src/popup/index.tsx',
-      offscreen:  './src/offscreen/ocr.ts',
+      offscreen:  './src/offscreen/offscreen-entry.ts',
     },
     output: {
       path: path.resolve(__dirname, 'dist'),
@@ -45,12 +45,17 @@ module.exports = (env, argv) => {
           { from: 'src/offscreen/ocr.html', to: 'offscreen.html' },
           { from: 'icons', to: 'icons', noErrorOnMissing: true },
           { from: 'models', to: 'models', noErrorOnMissing: true },
-          // ONNX Runtime Web WASM files — needed by YOLOS-Tiny WASM fallback.
-          // WebGPU path does not require these files.
+          // ONNX Runtime Web WASM and JS/MJS loader files — needed by YOLOS-Tiny.
           {
             from: 'node_modules/onnxruntime-web/dist',
             to: 'ort-wasm',
-            filter: async (resourcePath) => resourcePath.endsWith('.wasm'),
+            filter: async (resourcePath) => path.basename(resourcePath).startsWith('ort-wasm'),
+            noErrorOnMissing: true,
+          },
+          {
+            from: 'node_modules/@huggingface/transformers/node_modules/onnxruntime-web/dist',
+            to: 'ort-wasm',
+            filter: async (resourcePath) => path.basename(resourcePath).startsWith('ort-wasm'),
             noErrorOnMissing: true,
           },
         ],

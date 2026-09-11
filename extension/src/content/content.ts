@@ -14,7 +14,7 @@
  */
 
 import { detectPIIFromDOM, detectPIIFromDOMText, detectPIIFromText, detectPIIFromOCRWords, createFaceEntity, PLACEHOLDER_MAP } from '../privacy/pii-detector';
-import { buildOverlayBoxes, redactText, sanitizeElements, redactScreenshot, loadAndRedactScreenshot } from '../privacy/redaction-engine';
+import { buildOverlayBoxes, redactText, sanitizeElements, redactScreenshot, loadAndRedactScreenshot, SENSITIVITY_COLORS } from '../privacy/redaction-engine';
 import { processScreenshot } from '../vision/screenshot-redactor';
 import { detectFaces, isElementFixedOrSticky } from '../vision/face-detector';
 import { runYOLOSDetection, VisionInferenceStats } from '../vision/yolos-detector';
@@ -675,7 +675,13 @@ interface TrackedOverlayBox {
   baseBbox: BoundingBox;
 }
 
+interface BlurredDOMElementRecord {
+  el: HTMLElement;
+  originalFilter: string;
+}
+
 let trackedOverlayBoxes: TrackedOverlayBox[] = [];
+let blurredDOMElements: BlurredDOMElementRecord[] = [];
 let scrollRafId: number | null = null;
 let scrollListenerRegistered = false;
 
@@ -726,23 +732,36 @@ function renderOverlay(entities: PIIEntity[]): void {
   overlayContainer.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;z-index:2147483647;';
   document.body.appendChild(overlayContainer);
 
-  const boxes = buildOverlayBoxes(entities);
-  for (let i = 0; i < boxes.length; i++) {
-    const { bbox, label, color, targetElement, isFixed: boxIsFixed } = boxes[i];
-    const entity = entities[i];
+  const visualEntities = entities.filter(e => e.bbox);
+  for (const entity of visualEntities) {
+    const bbox = entity.bbox!;
+    const color = SENSITIVITY_COLORS[entity.sensitivity] ?? '#6b7280';
+    const label = `${entity.type.toUpperCase()} (${Math.round(entity.confidence * 100)}%)`;
 
-    let targetEl: HTMLElement | Element | null = targetElement || null;
-    if (!targetEl && entity?.domSelector) {
+    let targetEl: HTMLElement | Element | null = entity.targetElement || null;
+    if (!targetEl && entity.domSelector) {
       try { targetEl = document.querySelector(entity.domSelector); } catch {}
     }
+
+    // If targetEl is a wrapper container, resolve down to its inner img
+    if (targetEl instanceof HTMLElement && !(targetEl instanceof HTMLImageElement)) {
+      const childImg = targetEl.querySelector('img');
+      if (childImg) targetEl = childImg;
+    }
+
     if (!targetEl && bbox) {
       const vpX = bbox.x - window.scrollX + bbox.width / 2;
       const vpY = bbox.y - window.scrollY + bbox.height / 2;
       if (vpX >= 0 && vpX <= window.innerWidth && vpY >= 0 && vpY <= window.innerHeight) {
         const probe = document.elementFromPoint(vpX, vpY);
         if (probe && !probe.closest('#__privacy-agent-overlay__, #__privsight-host__')) {
-          if (entity?.type === 'face') {
-            targetEl = probe.closest('img, canvas, svg, [class*="avatar"], [class*="profile-photo"], [class*="user-photo"], [itemprop="image"]') || null;
+          if (entity.type === 'face') {
+            targetEl = (probe instanceof HTMLImageElement)
+              ? probe
+              : probe.querySelector('img')
+              || probe.closest('a, div')?.querySelector('img')
+              || probe.closest('img, canvas, svg, [class*="avatar"], [class*="profile-photo"], [class*="user-photo"], [itemprop="image"]')
+              || null;
           } else {
             targetEl = probe.closest('input, textarea, select, [contenteditable="true"]') || null;
           }
@@ -750,22 +769,45 @@ function renderOverlay(entities: PIIEntity[]): void {
       }
     }
 
-    // Validate targetEl: NEVER use layout containers (div, section, main, body) or oversized elements
+    // Overlapping search across all images on the page for faces
+    if (!targetEl && entity.type === 'face' && bbox) {
+      for (const img of Array.from(document.querySelectorAll<HTMLImageElement>('img'))) {
+        const ir = img.getBoundingClientRect();
+        if (ir.width >= 24 && ir.height >= 24) {
+          const ix = ir.left + window.scrollX;
+          const iy = ir.top + window.scrollY;
+          const xOverlap = Math.max(0, Math.min(ix + ir.width, bbox.x + bbox.width) - Math.max(ix, bbox.x));
+          const yOverlap = Math.max(0, Math.min(iy + ir.height, bbox.y + bbox.height) - Math.max(iy, bbox.y));
+          if (xOverlap > 0 && yOverlap > 0 && (xOverlap * yOverlap) / (ir.width * ir.height) > 0.25) {
+            targetEl = img;
+            break;
+          }
+        }
+      }
+    }
+
+    // If targetEl resolved to a wrapper container, extract the inner img
+    if (targetEl instanceof HTMLElement && !(targetEl instanceof HTMLImageElement)) {
+      const innerImg = targetEl.querySelector('img');
+      if (innerImg) targetEl = innerImg;
+    }
+
+    // Validate targetEl: NEVER use whole-page layout containers
     if (targetEl) {
       const r = targetEl.getBoundingClientRect();
-      const isLayoutTag = ['HTML', 'BODY', 'MAIN', 'SECTION', 'ARTICLE', 'DIV'].includes(targetEl.tagName.toUpperCase());
-      const isOversized = r.width > window.innerWidth * 0.4 || r.height > window.innerHeight * 0.4 || (entity?.type === 'face' && (r.width > 350 || r.height > 350));
-      if (isOversized || (isLayoutTag && entity?.type === 'face')) {
+      const isLayoutTag = ['HTML', 'BODY', 'MAIN', 'SECTION', 'ARTICLE'].includes(targetEl.tagName.toUpperCase());
+      const isOversized = r.width > window.innerWidth * 0.5 || r.height > window.innerHeight * 0.5 || (entity.type === 'face' && (r.width > 400 || r.height > 400));
+      if (isOversized || isLayoutTag) {
         targetEl = null;
       }
     }
 
     // If using bbox directly for a face, discard anomalous huge boxes
-    if (!targetEl && entity?.type === 'face' && (bbox.width > 350 || bbox.height > 350 || (bbox.width * bbox.height > window.innerWidth * window.innerHeight * 0.15))) {
+    if (!targetEl && entity.type === 'face' && (bbox.width > 400 || bbox.height > 400 || (bbox.width * bbox.height > window.innerWidth * window.innerHeight * 0.2))) {
       continue; // Skip anomalous false-positive face boxes that would cover large portions of the screen
     }
 
-    const isFixed = boxIsFixed || (targetEl ? isElementFixedOrSticky(targetEl) : false);
+    const isFixed = entity.isFixed || (targetEl ? isElementFixedOrSticky(targetEl) : false);
 
     let boxLeft = 0;
     let boxTop = 0;
@@ -785,14 +827,42 @@ function renderOverlay(entities: PIIEntity[]): void {
       boxHeight = bbox.height;
     }
 
-    // Never blur if the box is abnormally large (more than 40% of viewport in either dimension)
-    const isReasonablySized = boxWidth <= window.innerWidth * 0.4 && boxHeight <= window.innerHeight * 0.4 && boxWidth <= 400 && boxHeight <= 400;
-    const isSensitive = !entity || entity.sensitivity === 'CRITICAL' || entity.sensitivity === 'HIGH' || entity.type === 'face' || entity.type === 'email' || entity.type === 'password' || entity.type === 'phone' || entity.type === 'name';
-    const blurStyle = (isSensitive && isReasonablySized) ? 'backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);' : '';
+    // Never blur if the box is abnormally large (more than 50% of viewport in either dimension)
+    const isReasonablySized = boxWidth <= window.innerWidth * 0.5 && boxHeight <= window.innerHeight * 0.5 && boxWidth <= 450 && boxHeight <= 450;
+    const isSensitive = entity.sensitivity === 'CRITICAL' || entity.sensitivity === 'HIGH' || entity.type === 'face' || entity.type === 'email' || entity.type === 'password' || entity.type === 'phone' || entity.type === 'name';
+
+    // DIRECT DOM BLURRING:
+    // Chromium cannot sample hardware-accelerated/composited layers (like GitHub avatar img with border-radius: 50%)
+    // through an overlay div's backdrop-filter. Applying CSS filter directly to the DOM element guarantees visual blur on screen.
+    if (isSensitive && isReasonablySized && targetEl instanceof HTMLElement) {
+      const elementsToBlur: HTMLElement[] = [targetEl];
+      targetEl.querySelectorAll<HTMLElement>('img, canvas').forEach(sub => elementsToBlur.push(sub));
+      for (const el of elementsToBlur) {
+        if (!blurredDOMElements.some(b => b.el === el)) {
+          blurredDOMElements.push({
+            el,
+            originalFilter: el.style.filter || '',
+          });
+          el.style.setProperty('filter', 'blur(9px)', 'important');
+        }
+      }
+    }
+
+    const isFace = entity.type === 'face';
+    const isCircularAvatar = isFace && targetEl instanceof HTMLElement && (
+      window.getComputedStyle(targetEl).borderRadius === '50%' ||
+      targetEl.className?.includes('avatar')
+    );
+    const radiusStyle = isCircularAvatar ? 'border-radius:50%;' : 'border-radius:4px;';
     const posStyle = isFixed ? 'position:fixed;' : 'position:absolute;';
 
+    // Translucent privacy shield: subtle 12% tint with frosted glass so the underlying 9px blur is soft and visible, NOT a solid opaque disc
+    const bgStyle = isFace
+      ? 'background:rgba(245,124,0,0.12);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);'
+      : `background:${color}18;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);`;
+
     const box = document.createElement('div');
-    box.style.cssText = `${posStyle}left:${boxLeft}px;top:${boxTop}px;width:${boxWidth}px;height:${boxHeight}px;border:2px solid ${color};background:${color}25;${blurStyle}pointer-events:none;border-radius:4px;box-sizing:border-box;z-index:2147483640;`;
+    box.style.cssText = `${posStyle}left:${boxLeft}px;top:${boxTop}px;width:${boxWidth}px;height:${boxHeight}px;border:2px solid ${color};${bgStyle}pointer-events:none;${radiusStyle}box-sizing:border-box;z-index:2147483640;`;
 
     const lbl = document.createElement('div');
     lbl.style.cssText = `position:absolute;top:-20px;left:0;background:${color};color:#fff;font:bold 10px monospace;padding:2px 6px;border-radius:3px;white-space:nowrap;pointer-events:none;`;
@@ -817,6 +887,15 @@ function renderOverlay(entities: PIIEntity[]): void {
 }
 
 function clearOverlay(): void {
+  // Restore original CSS filters on any DOM elements directly blurred by PrivSight
+  for (const { el, originalFilter } of blurredDOMElements) {
+    try {
+      if (document.body.contains(el)) {
+        el.style.filter = originalFilter;
+      }
+    } catch {}
+  }
+  blurredDOMElements = [];
   trackedOverlayBoxes = [];
   if (scrollRafId !== null) {
     cancelAnimationFrame(scrollRafId);
