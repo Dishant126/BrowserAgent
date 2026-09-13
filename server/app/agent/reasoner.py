@@ -171,7 +171,7 @@ def format_context_for_llm(
         if aria:
             parts.append(f'aria="{aria}"')
         if el.value and not el.sensitive:
-            val_clean = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', '[EMAIL REDACTED]', str(el.value))
+            val_clean = re.sub(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b', '[EMAIL REDACTED]', el.value)
             parts.append(f'value="{val_clean}"')
         if el.sensitive or '[EMAIL REDACTED]' in lbl or '[EMAIL REDACTED]' in ph:
             parts.append(f'[REDACTED:{el.sensitivityType or "pii"}]')
@@ -432,13 +432,17 @@ class DynamicDOMSolverLLM:
         title_m = re.search(r'^PAGE TITLE:\s*(.+)$', prompt, re.MULTILINE)
         page_title = title_m.group(1).strip() if title_m else ""
 
+        # Extract sanitized page text
+        text_m = re.search(r'PAGE TEXT \(sanitized\):\n(.*?)(?:\n\n|\nINSTRUCTIONS:|$)', prompt, re.DOTALL)
+        sanitized_text = text_m.group(1).strip() if text_m else ""
+
         # Parse element lines
         elements = []
         for line in prompt.splitlines():
             if line.strip().startswith("- ["):
                 elements.append(line.strip())
 
-        result = self._solve(task, step, elements, history, page_url=page_url, page_title=page_title, conv_history=conv_history)
+        result = self._solve(task, step, elements, history, page_url=page_url, page_title=page_title, conv_history=conv_history, sanitized_text=sanitized_text)
 
         class R:
             def __init__(self, c): self.content = c
@@ -453,6 +457,7 @@ class DynamicDOMSolverLLM:
         page_url: str = "",
         page_title: str = "",
         conv_history: list[dict] | None = None,
+        sanitized_text: str = "",
     ) -> str:
         """General-purpose browser task solver. Parses actual el_NNN element IDs and
         matches task keywords against any element type (button, link, input, etc.)."""
@@ -664,6 +669,36 @@ class DynamicDOMSolverLLM:
                 "confidence": 0.95,
             })
 
+        # ── SPECIAL HANDLING 2b: Payment Gateway / Card Details (Human-In-The-Loop) ──────────
+        has_card_or_cvv_in_lines = any(
+            any(w in line.lower() for w in ["credit_card", "cvv", "card", "expiry"])
+            for line in elem_lines
+        )
+        is_payment_flow = (
+            "razorpay" in page_url.lower() or
+            "checkout" in page_url.lower() or
+            "payment" in page_url.lower() or
+            any(k in task_lower for k in ["pay", "card", "checkout", "continue", "buy"]) or
+            has_card_or_cvv_in_lines
+        )
+        has_card_or_cvv_inputs = any(
+            el["is_input"] and any(k in el["hint"] for k in ["card", "cvv", "expiry", "mm / yy", "security", "number"])
+            for el in parsed
+        ) or has_card_or_cvv_in_lines
+
+        if is_payment_flow and has_card_or_cvv_inputs:
+            last_user_msg = next((m.get("text", "") for m in reversed(conv_history or []) if m.get("role") == "user"), "")
+            # Only treat explicit confirmation phrases as having completed card entry
+            already_confirmed = any(k in last_user_msg.lower() for k in ["done", "entered", "filled", "typed", "submitted", "card added", "details added", "i have entered"])
+            if not already_confirmed:
+                return json.dumps({
+                    "action": "ask_user",
+                    "prompt": "Please enter your card number, expiry date, and CVV to proceed with payment. All your financial details remain completely masked and private on your local device.",
+                    "reason": "Payment security: Card details and CVV must be entered by the user with Human-in-the-Loop",
+                    "confidence": 0.98,
+                })
+
+
         # ── SPECIAL HANDLING 3: Autocomplete suggestion selection (origin / destination) ──────────
         for el in parsed:
             if ("click", el["el_id"]) in done_set: continue
@@ -747,7 +782,7 @@ class DynamicDOMSolverLLM:
             })
 
         # If on download page and download button was clicked or file has finished converting, complete task
-        is_on_download_page = "/download" in page_url.lower() or "converted to an editable" in (page_title + " " + getattr(context, "sanitizedText", "")).lower()
+        is_on_download_page = "/download" in page_url.lower() or "converted to an editable" in (page_title + " " + sanitized_text).lower()
         if is_on_download_page and (len(history or []) > 0 or ("click", download_btn["el_id"] if download_btn else "") in done_set):
             return json.dumps({
                 "action": "done",
@@ -853,7 +888,7 @@ class DynamicDOMSolverLLM:
             confidence = 0.95
             display_clean = display.replace("_", " ").title()
 
-            is_confirmed_turn = bool(
+            is_confirmed_turn = (
                 is_pronoun_reference or
                 task_lower in ("click it", "it", "yes", "confirm", "proceed", "sure", "ok") or
                 any(w in task_lower for w in ["yes", "confirm", "proceed", "go ahead", "approved"])

@@ -10,6 +10,7 @@ import type {
   PIISource, BoundingBox, OcrWord, PrivacySettings
 } from '../utils/types';
 import { isElementFixedOrSticky } from '../vision/face-detector';
+import { isElementOccluded, isRectOccluded } from '../utils/dom-visibility';
 
 let entityCounter = 0;
 const nextId = () => `pii-${Date.now()}-${++entityCounter}`;
@@ -73,15 +74,21 @@ export const PLACEHOLDER_MAP: Record<PIIType, string> = {
 
 // ── REGEX PATTERNS ─────────────────────────────────────────────────────────────
 
+const EMAIL_REGEX = /^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$/;
+const PHONE_REGEX = /^(?:\+?\d{1,3}[\s\-]?)?(?:\(?\d{2,4}\)?[\s\-]?)?\d{3,5}[\s\-]?\d{3,5}$/;
+
 const PATTERNS: Array<{ type: PIIType; pattern: RegExp; confidence: number }> = [
   // Email
   { type: 'email',       pattern: /\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b/g,                      confidence: 0.98 },
-  // Phone (Indian +91 format, 10-digit, with separators)
-  { type: 'phone',       pattern: /(\+91[\s\-]?)?[6-9]\d{4}[\s\-]?\d{5}\b/g,                                     confidence: 0.92 },
+  // Phone (Indian +91 format, 10-digit, with flexible separators)
+  { type: 'phone',       pattern: /(?:\+91[\s\-]?)?[6-9]\d{4}[\s\-]?\d{5}\b/g,                                   confidence: 0.92 },
+  { type: 'phone',       pattern: /(?:\+91[\s\-]?)?[6-9]\d{2,4}[\s\-]?\d{2,4}[\s\-]?\d{3,5}\b/g,                 confidence: 0.90 },
   // International phone
   { type: 'phone',       pattern: /\+?1?\s?\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4}\b/g,                              confidence: 0.85 },
-  // Credit card (16-digit, with spaces or dashes)
-  { type: 'credit_card', pattern: /\b(?:\d[ \-]?){13,15}\d\b/g,                                                   confidence: 0.90 },
+  // Credit card (13 to 19 digits, with spaces or dashes e.g. 6027 6589 0000 1005)
+  { type: 'credit_card', pattern: /\b(?:\d[ \-]?){12,18}\d\b/g,                                                   confidence: 0.92 },
+  // Card Expiry Date (MM / YY or MM/YY e.g. 12 / 29)
+  { type: 'credit_card', pattern: /\b(?:0[1-9]|1[0-2])\s*\/\s*(?:2\d|3\d)\b/g,                                  confidence: 0.88 },
   // Aadhaar (12 digits, starting with 2-9, separated by spaces or dashes)
   { type: 'aadhaar',     pattern: /\b[2-9]\d{3}[\s-]\d{4}[\s-]\d{4}\b/g,                                          confidence: 0.92 },
   // PAN Card
@@ -112,6 +119,8 @@ const SENSITIVE_AUTOCOMPLETE: Record<string, PIIType> = {
   'cc-number':         'credit_card',
   'cc-csc':            'cvv',
   'cc-exp':            'credit_card',
+  'cc-exp-month':      'credit_card',
+  'cc-exp-year':       'credit_card',
   'cc-name':           'name',
   'email':             'email',
   'tel':               'phone',
@@ -122,19 +131,22 @@ const SENSITIVE_AUTOCOMPLETE: Record<string, PIIType> = {
   'address-line1':     'address',
   'postal-code':       'address',
   'bday':              'dob',
+  'one-time-code':     'password',
 };
 
 const SENSITIVE_PLACEHOLDER_PATTERNS: Array<{ pattern: RegExp; type: PIIType }> = [
-  { pattern: /email|e-mail/i,       type: 'email' },
-  { pattern: /phone|mobile|cell/i,  type: 'phone' },
-  { pattern: /password|pass|pin/i,  type: 'password' },
-  { pattern: /card.?num|credit/i,   type: 'credit_card' },
-  { pattern: /cvv|cvc|csc/i,        type: 'cvv' },
-  { pattern: /aadhaar|aadhar/i,     type: 'aadhaar' },
-  { pattern: /\bpan\b/i,            type: 'pan' },
-  { pattern: /address/i,            type: 'address' },
-  { pattern: /upi/i,                type: 'upi' },
-  { pattern: /ifsc/i,               type: 'ifsc' },
+  { pattern: /email|e-mail/i,                               type: 'email' },
+  { pattern: /phone|mobile|cell|contact.?no/i,               type: 'phone' },
+  { pattern: /password|pass|pin\b/i,                         type: 'password' },
+  { pattern: /card|credit|debit|cc[-_]?num|pan\b/i,          type: 'credit_card' },
+  { pattern: /cvv|cvc|csc|security.?code|verification/i,     type: 'cvv' },
+  { pattern: /exp|expiry|expiration|valid.?thru|mm\s*\/?\s*yy/i, type: 'credit_card' },
+  { pattern: /otp|one[-_]?time|passcode/i,                   type: 'password' },
+  { pattern: /aadhaar|aadhar/i,                              type: 'aadhaar' },
+  { pattern: /\bpan\b/i,                                     type: 'pan' },
+  { pattern: /address/i,                                     type: 'address' },
+  { pattern: /upi/i,                                         type: 'upi' },
+  { pattern: /ifsc/i,                                        type: 'ifsc' },
 ];
 
 // ── LAYER 1: DOM ANALYSIS ─────────────────────────────────────────────────────
@@ -143,7 +155,7 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
   const entities: PIIEntity[] = [];
   const enabledTypes = new Set(settings.enabledCategories);
 
-  // Query all input, select, textarea elements
+  // Query all input, select, textarea elements in top-level document
   const formElements = document.querySelectorAll<HTMLElement>(
     'input, select, textarea, [data-pii-type]'
   );
@@ -151,6 +163,7 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
   formElements.forEach(el => {
     const rect = el.getBoundingClientRect();
     if (rect.width === 0 && rect.height === 0) return; // hidden element
+    if (isElementOccluded(el, rect)) return; // occluded or covered by modal/backdrop
 
     const bbox: BoundingBox = {
       x: rect.left + window.scrollX,
@@ -166,6 +179,14 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
     const id = input.id?.toLowerCase() ?? '';
     const placeholder = input.placeholder?.toLowerCase() ?? '';
     const dataPiiType = el.getAttribute('data-pii-type') ?? '';
+
+    const ariaLabel = input.getAttribute('aria-label')?.toLowerCase() ?? '';
+    const ariaPlaceholder = input.getAttribute('aria-placeholder')?.toLowerCase() ?? '';
+    const titleAttr = input.getAttribute('title')?.toLowerCase() ?? '';
+    const testId = input.getAttribute('data-testid')?.toLowerCase() ?? '';
+    const className = (input.className && typeof input.className === 'string') ? input.className.toLowerCase() : '';
+    const labelText = (input.closest('label')?.textContent || input.previousElementSibling?.textContent || '').toLowerCase();
+    const combinedDescriptor = `${name} ${id} ${placeholder} ${ariaLabel} ${ariaPlaceholder} ${titleAttr} ${testId} ${className} ${labelText}`;
 
     let detectedType: PIIType | null = null;
     let confidence = 0;
@@ -188,16 +209,41 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
     // Rule 4: Input type=email/tel
     else if (type === 'email') { detectedType = 'email'; confidence = 0.99; }
     else if (type === 'tel') { detectedType = 'phone'; confidence = 0.95; }
-    // Rule 5: Name/ID/placeholder heuristics
+    // Rule 5: Name/ID/placeholder/aria-label heuristics
     else {
       for (const { pattern, type: pType } of SENSITIVE_PLACEHOLDER_PATTERNS) {
-        if (pattern.test(name) || pattern.test(id) || pattern.test(placeholder)) {
+        if (pattern.test(combinedDescriptor)) {
           if (enabledTypes.has(pType)) {
             detectedType = pType;
-            confidence = 0.82;
+            confidence = 0.85;
             break;
           }
         }
+      }
+    }
+
+    // Rule 6: Input Value Inspection (e.g. Card number, CVV, Phone filled in)
+    const rawVal = (input.value || '').trim();
+    if (!detectedType && rawVal) {
+      const cleanDigits = rawVal.replace(/\D/g, '');
+      if (cleanDigits.length >= 13 && cleanDigits.length <= 19 && enabledTypes.has('credit_card')) {
+        detectedType = 'credit_card';
+        confidence = 0.96;
+      } else if (EMAIL_REGEX.test(rawVal) && enabledTypes.has('email')) {
+        detectedType = 'email';
+        confidence = 0.98;
+      } else if (PHONE_REGEX.test(rawVal) && enabledTypes.has('phone')) {
+        detectedType = 'phone';
+        confidence = 0.95;
+      } else if ((/^\d{3,4}$|^\.{3,4}$|^\*{3,4}$/.test(rawVal) && (/cvv|cvc|csc|security|code/i.test(combinedDescriptor) || input.maxLength === 3 || input.maxLength === 4)) && enabledTypes.has('cvv')) {
+        detectedType = 'cvv';
+        confidence = 0.97;
+      } else if (/^(?:0[1-9]|1[0-2])\s*\/\s*(?:2\d|3\d)$/.test(rawVal) && enabledTypes.has('credit_card')) {
+        detectedType = 'credit_card';
+        confidence = 0.92;
+      } else if (/^\d{4,8}$/.test(cleanDigits) && /otp|passcode|verification/i.test(combinedDescriptor) && enabledTypes.has('password')) {
+        detectedType = 'password';
+        confidence = 0.95;
       }
     }
 
@@ -229,6 +275,8 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
     if (!piiType || !enabledTypes.has(piiType)) return;
 
     const rect = el.getBoundingClientRect();
+    if (isElementOccluded(el, rect)) return;
+
     const bbox: BoundingBox = {
       x: rect.left + window.scrollX,
       y: rect.top + window.scrollY,
@@ -253,6 +301,80 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
       timestamp: Date.now(),
     });
   });
+
+  // Also scan accessible same-origin/embedded iframes (e.g. payment checkout frames)
+  try {
+    document.querySelectorAll<HTMLIFrameElement>('iframe').forEach(frame => {
+      try {
+        const frameDoc = frame.contentDocument;
+        if (!frameDoc || !frameDoc.body) return;
+        const frameRect = frame.getBoundingClientRect();
+        if (frameRect.width <= 0 || frameRect.height <= 0) return;
+
+        const frameInputs = frameDoc.querySelectorAll<HTMLElement>('input, select, textarea, [data-pii-type]');
+        frameInputs.forEach(fEl => {
+          const r = fEl.getBoundingClientRect();
+          if (r.width === 0 && r.height === 0) return;
+
+          const bbox: BoundingBox = {
+            x: Math.round(frameRect.left + r.left + window.scrollX),
+            y: Math.round(frameRect.top + r.top + window.scrollY),
+            width: Math.round(r.width),
+            height: Math.round(r.height),
+          };
+
+          const fInput = fEl as HTMLInputElement;
+          const fName = fInput.name?.toLowerCase() ?? '';
+          const fId = fInput.id?.toLowerCase() ?? '';
+          const fPh = fInput.placeholder?.toLowerCase() ?? '';
+          const fAria = fInput.getAttribute('aria-label')?.toLowerCase() ?? '';
+          const fClass = (fInput.className && typeof fInput.className === 'string') ? fInput.className.toLowerCase() : '';
+          const fCombined = `${fName} ${fId} ${fPh} ${fAria} ${fClass}`;
+
+          let fDetected: PIIType | null = null;
+          if (fInput.type === 'password') fDetected = 'password';
+          else if (fInput.type === 'email') fDetected = 'email';
+          else if (fInput.type === 'tel') fDetected = 'phone';
+          else {
+            for (const { pattern, type: pType } of SENSITIVE_PLACEHOLDER_PATTERNS) {
+              if (pattern.test(fCombined) && enabledTypes.has(pType)) {
+                fDetected = pType;
+                break;
+              }
+            }
+          }
+
+          const fVal = (fInput.value || '').trim();
+          if (!fDetected && fVal) {
+            const digits = fVal.replace(/\D/g, '');
+            if (digits.length >= 13 && digits.length <= 19 && enabledTypes.has('credit_card')) fDetected = 'credit_card';
+            else if (EMAIL_REGEX.test(fVal) && enabledTypes.has('email')) fDetected = 'email';
+            else if (PHONE_REGEX.test(fVal) && enabledTypes.has('phone')) fDetected = 'phone';
+            else if (/^\d{3,4}$|^\.{3,4}$/.test(fVal) && /cvv|cvc|security/i.test(fCombined)) fDetected = 'cvv';
+          }
+
+          if (fDetected && enabledTypes.has(fDetected)) {
+            const sensitivity = SENSITIVITY_MAP[fDetected];
+            entities.push({
+              id: nextId(),
+              type: fDetected,
+              confidence: 0.95,
+              source: 'dom',
+              sensitivity,
+              redactionMethod: getRedactionMethod(sensitivity, settings),
+              bbox,
+              targetElement: fEl as HTMLElement,
+              isFixed: true,
+              domSelector: getSelector(fEl),
+              rawValue: fInput.value || undefined,
+              placeholder: PLACEHOLDER_MAP[fDetected],
+              timestamp: Date.now(),
+            });
+          }
+        });
+      } catch {}
+    });
+  } catch {}
 
   return deduplicate(entities);
 }
@@ -297,6 +419,12 @@ export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
       const text = currentNode.nodeValue || '';
       const textNode = currentNode as Text;
 
+      // Skip text nodes whose parent container is occluded by modal/backdrop
+      if (textNode.parentElement && isElementOccluded(textNode.parentElement)) {
+        currentNode = walker.nextNode();
+        continue;
+      }
+
       // 1. Scan regex patterns (Email, Phone, Card, Govt ID, UPI, etc.)
       for (const { type, pattern, confidence } of PATTERNS) {
         if (!enabledTypes.has(type)) continue;
@@ -312,6 +440,8 @@ export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
             const rect = range.getBoundingClientRect();
 
             if (rect.width > 2 && rect.height > 2) {
+              if (isRectOccluded(rect, textNode.parentElement)) continue;
+
               const bbox: BoundingBox = {
                 x: Math.round(rect.left + window.scrollX),
                 y: Math.round(rect.top + window.scrollY),
@@ -354,6 +484,8 @@ export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
               range.setEnd(textNode, nameIndex + nameValue.length);
               const rect = range.getBoundingClientRect();
               if (rect.width > 2 && rect.height > 2) {
+                if (isRectOccluded(rect, textNode.parentElement)) continue;
+
                 const bbox: BoundingBox = {
                   x: Math.round(rect.left + window.scrollX),
                   y: Math.round(rect.top + window.scrollY),
@@ -392,6 +524,7 @@ export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
       const candidateElements = document.querySelectorAll<HTMLElement>('label, dt, h1, h2, [class*="author"], [class*="profile-name"], [class*="user-name"], [class*="vcard-names"]');
       candidateElements.forEach(el => {
         if (el.children.length > 25) return;
+        if (isElementOccluded(el)) return;
         const text = (el.innerText || '').trim();
         if (text.length < 3 || text.length > 300) return;
 
@@ -434,6 +567,8 @@ export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
             }
 
             if (targetRect && targetRect.width > 2 && targetRect.height > 2) {
+              if (isElementOccluded(targetEl, targetRect)) return;
+
               const bbox: BoundingBox = {
                 x: Math.round(targetRect.left + window.scrollX),
                 y: Math.round(targetRect.top + window.scrollY),
@@ -487,6 +622,7 @@ export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
         }
 
         if (valEl) {
+          if (isElementOccluded(valEl)) return;
           const valText = (valEl.innerText || '').trim();
           if (valText && valText.length >= 2 && valText.length <= 30 && /^[A-Za-z\u00C0-\u024F\s.'-]+$/.test(valText) && !FORBIDDEN_WORDS.test(valText)) {
             const rect = valEl.getBoundingClientRect();
@@ -530,6 +666,7 @@ export function detectPIIFromDOMText(settings: PrivacySettings): PIIEntity[] {
         '[itemprop="name"], .p-name, .vcard-fullname, .profile-name, [class*="profile-fullname"], [class*="user-fullname"], .vcard-names span:first-child'
       );
       profileNameElements.forEach(pEl => {
+        if (isElementOccluded(pEl)) return;
         const textVal = (pEl.innerText || '').trim();
         if (textVal.length >= 2 && textVal.length <= 40 && !FORBIDDEN_WORDS.test(textVal)) {
           const rect = pEl.getBoundingClientRect();

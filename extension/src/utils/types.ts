@@ -308,7 +308,7 @@ export interface SiteStatus {
 // ── EXTENSION MESSAGES ─────────────────────────────────────────────────────────
 
 export type ExtensionMessage =
-  | { type: 'ANALYZE_PAGE'; forceRefresh?: boolean; screenshot?: string }
+  | { type: 'ANALYZE_PAGE'; forceRefresh?: boolean; screenshot?: string; stepId?: number; taskId?: string }
   | { type: 'ACTION_REQUEST'; action: BrowserAction; actionId?: string }
   | { type: 'SETTINGS_UPDATE'; settings: PrivacySettings }
   | { type: 'GET_STATUS' }
@@ -332,7 +332,7 @@ export type ExtensionMessage =
   | { type: 'CHAT_MESSAGE'; message: ChatMessage }
   | { type: 'TRACE_EVENT'; event: TraceEvent }
   | { type: 'CAPTURE_SCREENSHOT' }
-  | { type: 'CLEAR_OVERLAYS' }
+  | { type: 'CLEAR_OVERLAYS'; stepId?: number; reason?: string }
   | { type: 'VIT_INFERENCE'; imageData?: string; requestId?: string; threshold?: number }
   | { type: 'VERIFY_PII'; candidates?: string[]; url?: string }
   | { type: 'REDACTED_PREVIEW'; dataUrl?: string; entitiesApplied?: number; piiTypes?: string[] }

@@ -15,7 +15,7 @@ import type {
   ExtensionMessage, BrowserAction, SanitizedContext, AuditEvent,
   TaskState, SiteStatus, SiteCompatibility, ChatMessage, TraceEvent, TraceEventType
 } from '../utils/types';
-import { getSafeSpokenActionMessage, getDomainFromUrl } from '../utils/speech-synthesis';
+import { getSafeSpokenActionMessage, getDomainFromUrl, sanitizeTextForSpeech, containsSensitiveData } from '../utils/speech-synthesis';
 
 const SERVER_URL = 'http://localhost:8000/api';
 const MAX_STEPS = 20;
@@ -240,6 +240,15 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
 
     case 'STOP_TASK': {
       currentTask.stopped = true;
+      if (currentActiveTabId) {
+        sendMessageToTab(currentActiveTabId, { type: 'CLEAR_OVERLAYS', reason: 'agent_stopped' }).catch(() => {});
+      }
+      chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+        const tid = tabs[0]?.id;
+        if (tid && tid !== currentActiveTabId) {
+          sendMessageToTab(tid, { type: 'CLEAR_OVERLAYS', reason: 'agent_stopped' }).catch(() => {});
+        }
+      });
       if (currentTask.pendingApproval) {
         const resolver = pendingApprovals.get(currentTask.pendingApproval.actionId);
         if (resolver) resolver(false);
@@ -615,6 +624,11 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       emitTraceEvent('SCAN_STARTED', `Scanning tab #${activeTabId} viewport and DOM`, stepNum);
       broadcastChatMessage({ kind: 'status', text: '🔍 Scanning page...' });
 
+      // Ensure tab overlays from prior steps or actions are cleared before capturing screenshot
+      if (stepNum > 1) {
+        await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', stepId: stepNum - 1, reason: 'pre_screenshot' }).catch(() => {});
+      }
+
       // Always capture a fresh screenshot of the target tab for every step
       let screenshot: string | undefined = undefined;
       try {
@@ -640,12 +654,14 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
         type: 'ANALYZE_PAGE',
         forceRefresh: true,
         screenshot,
+        stepId: stepNum,
       });
 
       if (!analysisResult || !analysisResult.context) {
         console.warn('[Background] Page analysis failed at step', stepNum);
         currentTask.retryCount++;
         if (currentTask.retryCount >= 3) {
+          await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', reason: 'analysis_failure' }).catch(() => {});
           setTaskState('ERROR');
           emitTraceEvent('ERROR', 'Failed to inspect page DOM after retries', stepNum);
           broadcastChatMessage({ kind: 'error', text: 'Unable to read page elements. Please refresh the page tab (Ctrl+R) and try again.' });
@@ -811,6 +827,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
         });
       } catch (netErr) {
         console.error('[Background] Server unreachable:', netErr);
+        await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', reason: 'server_unreachable' }).catch(() => {});
         setTaskState('ERROR');
         emitTraceEvent('ERROR', 'Reasoning server unreachable', stepNum);
         broadcastChatMessage({ kind: 'error', text: 'Cannot reach reasoning server (http://localhost:8000). Is it running?' });
@@ -819,6 +836,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
 
       if (!serverRes.ok) {
         const errText = await serverRes.text();
+        await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', reason: 'server_error' }).catch(() => {});
         setTaskState('ERROR');
         emitTraceEvent('ERROR', `Server error (${serverRes.status}): ${errText.slice(0, 100)}`, stepNum);
         broadcastChatMessage({ kind: 'error', text: `Server error (${serverRes.status}): ${errText.slice(0, 160)}` });
@@ -868,6 +886,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
 
         if (isFailure) {
           setTaskState('ERROR');
+          await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', reason: 'task_failure' }).catch(() => {});
           emitTraceEvent('ERROR', action.reason || 'No matching element found', stepNum);
           broadcastChatMessage({
             kind: 'error',
@@ -891,6 +910,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
         if (spokenDone) {
           broadcastToAll({ type: 'SPEAK_ACTION_STATUS', text: spokenDone, actionType: 'done' });
         }
+        await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', reason: 'task_completed' }).catch(() => {});
         setTaskState('COMPLETED');
         broadcastTaskDone(doneReason);
         await delay(500);
@@ -901,12 +921,13 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       // Handle ask_user
       if (action.action === 'ask_user') {
         setTaskState('USER_REQUIRED');
-        const promptText = action.prompt || 'Please provide input or enter details on the page to continue:';
+        await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', reason: 'ask_user' }).catch(() => {});
+        const promptText = action.prompt || action.reason || 'Please provide input or enter details on the page to continue:';
         broadcastChatMessage({
           kind: 'assistant',
           text: promptText,
         });
-        const spokenAsk = getSafeSpokenActionMessage(action, targetFriendlyName);
+        const spokenAsk = getSafeSpokenActionMessage({ ...action, prompt: promptText }, targetFriendlyName);
         if (spokenAsk) {
           broadcastToAll({ type: 'SPEAK_ACTION_STATUS', text: spokenAsk, actionType: 'ask_user' });
         }
@@ -947,14 +968,19 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
           actionId: confirmActionId,
           actionPill,
         });
-        const spokenConfirm = targetFriendlyName
-          ? `Would you like me to click ${targetFriendlyName}?`
-          : 'Waiting for your confirmation.';
+        const spokenConfirm = action.prompt
+          ? sanitizeTextForSpeech(action.prompt, 100)
+          : (action.reason && !containsSensitiveData(action.reason)
+              ? sanitizeTextForSpeech(action.reason, 100)
+              : (targetFriendlyName
+                  ? `Would you like me to click ${targetFriendlyName}?`
+                  : 'Waiting for your confirmation.'));
         broadcastToAll({ type: 'SPEAK_ACTION_STATUS', text: spokenConfirm, actionType: 'ask_user' });
 
         const approved = await requestActionApproval(action, confirmActionId, confidence);
         if (!approved) {
           console.log('[Background] User cancelled action at step', stepNum);
+          await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', reason: 'action_cancelled' }).catch(() => {});
           broadcastChatMessage({
             kind: 'assistant',
             text: 'Action cancelled. What would you like to do next?',
@@ -980,6 +1006,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       let execResult: any;
       if (action.action === 'navigate' && action.url) {
         broadcastChatMessage({ kind: 'status', text: `🌐 Navigating to ${action.url}...` });
+        await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', stepId: stepNum, reason: 'pre_navigate' }).catch(() => {});
         await chrome.tabs.update(activeTabId, { url: action.url });
         await waitForTabToSettle(activeTabId, 8000);
         execResult = { success: true };
@@ -991,8 +1018,16 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
         });
       }
 
+      // Immediately clear overlays right upon action execution completion so no stale masks linger
+      await sendMessageToTab(activeTabId, {
+        type: 'CLEAR_OVERLAYS',
+        stepId: stepNum,
+        reason: 'action_completed',
+      }).catch(() => {});
+
       if (!execResult || !execResult.success) {
         console.warn('[Background] Action execution failed:', execResult?.error);
+        await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', reason: 'action_failed' }).catch(() => {});
         setTaskState('ERROR');
         emitTraceEvent('ERROR', `Action execution failed: ${execResult?.error ?? 'Target element not interactive'}`, stepNum);
         broadcastChatMessage({
@@ -1010,8 +1045,12 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       await waitForTabToSettle(activeTabId, 2500);
       emitTraceEvent('ACTION_VERIFIED', `Page state verified after ${action.action.toUpperCase()}`, stepNum);
 
-      // Clear any stale visual overlay boxes from the previous page
-      sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS' }).catch(() => {});
+      // Re-verify that page visual state is completely clean before Step transition
+      await sendMessageToTab(activeTabId, {
+        type: 'CLEAR_OVERLAYS',
+        stepId: stepNum,
+        reason: 'step_transition',
+      }).catch(() => {});
 
       currentTask.previousActions.push(action);
       currentTask.stepNumber++;
@@ -1039,6 +1078,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
           text: completeMsg,
           actionPill: 'TASK COMPLETED',
         });
+        await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', reason: 'task_completed' }).catch(() => {});
         setTaskState('COMPLETED');
         broadcastTaskDone(completeMsg);
         await delay(500);
@@ -1063,6 +1103,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
             text: fileMsg,
             actionPill: 'UPLOAD ACTIVE',
           });
+          await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', reason: 'task_completed' }).catch(() => {});
           setTaskState('COMPLETED');
           broadcastTaskDone(fileMsg);
           await delay(500);
@@ -1504,7 +1545,7 @@ async function sendMessageToTab(tabId: number, msg: ExtensionMessage): Promise<a
       }
     };
 
-    chrome.tabs.sendMessage(tabId, msg, async (response) => {
+    chrome.tabs.sendMessage(tabId, msg, { frameId: 0 }, async (response) => {
       if (chrome.runtime.lastError) {
         const errMsg = chrome.runtime.lastError.message || '';
         console.warn(`[Background] Send message to tab ${tabId} failed: ${errMsg}`);
@@ -1513,7 +1554,7 @@ async function sendMessageToTab(tabId: number, msg: ExtensionMessage): Promise<a
           try {
             await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] }).catch(() => {});
             await delay(400);
-            chrome.tabs.sendMessage(tabId, msg, (retryResp) => {
+            chrome.tabs.sendMessage(tabId, msg, { frameId: 0 }, (retryResp) => {
               if (chrome.runtime.lastError) {
                 console.warn('[Background] Retry failed:', chrome.runtime.lastError.message);
                 safeResolve(null);

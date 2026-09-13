@@ -47,20 +47,23 @@ export function containsSensitiveData(text: string): boolean {
 
 /**
  * Sanitizes search / input queries for spoken output:
- * - Strips any detected PII
- * - Limits length to ~30 characters to avoid excessive speech
+ * - Strips any detected PII (emails, phones, cards, tokens, CVVs)
+ * - Limits length to ~100 characters to avoid excessive speech
  * - Replaces URLs with clean domains
  */
-export function sanitizeTextForSpeech(text: string, maxLength: number = 32): string {
+export function sanitizeTextForSpeech(text: string, maxLength: number = 100): string {
   if (!text) return '';
   let clean = text.trim();
 
+  // Strip CVV / security codes
+  clean = clean.replace(/\b(?:cvv|cvc|csc|security\s*code)\s*[:=]?\s*\d{3,4}\b/gi, 'security code');
   // If text contains an email, mask it
   clean = clean.replace(EMAIL_REGEX, 'email address');
   // If text contains a phone number, mask it
   clean = clean.replace(PHONE_REGEX, 'phone number');
   // If text contains a credit card, mask it
   clean = clean.replace(CREDIT_CARD_REGEX, 'card details');
+  clean = clean.replace(/\b(?:\d[ \-]?){12,18}\d\b/g, 'card number');
   // Strip tokens/keys
   clean = clean.replace(TOKEN_KEY_REGEX, 'secret key');
   // Clean up any remaining redaction brackets
@@ -93,7 +96,8 @@ export function getDomainFromUrl(url: string): string {
 /**
  * Creates a safe, action-aware spoken message from a BrowserAction.
  * Strictly avoids internal state narration (PERCEIVING, SANITIZING, PLANNING).
- * Returns null if the action does not warrant spoken feedback.
+ * Prioritizes the agent's actual response message or prompt when available,
+ * falling back to keyword descriptions so the user is never confused.
  */
 export function getSafeSpokenActionMessage(
   action: BrowserAction,
@@ -112,6 +116,9 @@ export function getSafeSpokenActionMessage(
 
     case 'click': {
       const label = targetFriendlyName || action.target?.friendlyName || action.target?.label || '';
+      if (action.reason && !containsSensitiveData(action.reason) && action.reason.length < 60) {
+        return sanitizeTextForSpeech(action.reason, 60);
+      }
       if (label) {
         const safeLabel = sanitizeTextForSpeech(label, 30);
         // Distinguish common actions
@@ -121,6 +128,9 @@ export function getSafeSpokenActionMessage(
         if (/download/i.test(safeLabel)) {
           return `Downloading ${safeLabel}.`;
         }
+        if (/pay|continue|proceed/i.test(safeLabel)) {
+          return `Clicking ${safeLabel}.`;
+        }
         return `Opening ${safeLabel}.`;
       }
       return 'Clicking selected element.';
@@ -129,6 +139,18 @@ export function getSafeSpokenActionMessage(
     case 'fill': {
       const targetName = (targetFriendlyName || action.target?.friendlyName || action.target?.label || '').toLowerCase();
       const rawVal = action.value || '';
+
+      // Check card / financial fields first
+      if (targetName.includes('card') || targetName.includes('credit') || targetName.includes('debit') || targetName.includes('cc')) {
+        return 'Entering the card number.';
+      }
+      if (targetName.includes('cvv') || targetName.includes('cvc') || targetName.includes('csc') || targetName.includes('security')) {
+        return 'Entering the card security code.';
+      }
+      if (targetName.includes('exp') || targetName.includes('valid') || targetName.includes('date')) {
+        return 'Entering the card expiry date.';
+      }
+
       const isSensitiveField =
         targetName.includes('password') ||
         targetName.includes('pin') ||
@@ -174,10 +196,15 @@ export function getSafeSpokenActionMessage(
     }
 
     case 'ask_user': {
-      if (targetFriendlyName) {
+      // Prioritize the actual prompt or reason from the agent
+      const promptMsg = action.prompt || action.reason;
+      if (promptMsg && !containsSensitiveData(promptMsg)) {
+        return sanitizeTextForSpeech(promptMsg, 100);
+      }
+      if (targetFriendlyName && !/pay|submit|click|button/i.test(targetFriendlyName)) {
         return `Would you like me to click ${sanitizeTextForSpeech(targetFriendlyName, 25)}?`;
       }
-      return 'Waiting for your confirmation.';
+      return 'Please enter the required details on the page to continue.';
     }
 
     case 'finish':
@@ -192,8 +219,14 @@ export function getSafeSpokenActionMessage(
       return 'Done. Task completed.';
     }
 
-    default:
+    default: {
+      // If no keyword matches, speak the sanitized prompt or reason directly
+      const fallbackMsg = action.prompt || action.reason;
+      if (fallbackMsg && !containsSensitiveData(fallbackMsg)) {
+        return sanitizeTextForSpeech(fallbackMsg, 100);
+      }
       return null;
+    }
   }
 }
 

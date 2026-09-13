@@ -11,6 +11,7 @@
  */
 
 import type { ElementRecord, BoundingBox } from '../utils/types';
+import { isElementOccluded } from '../utils/dom-visibility';
 
 // ── REGISTRY STATE ────────────────────────────────────────────────────────────
 
@@ -79,6 +80,10 @@ export function buildRegistry(): ElementRecord[] {
     if (rect.width === 0 && rect.height === 0) return;
     if (rect.top > window.innerHeight + 500) return; // far off-screen
 
+    const isSensitive = detectSensitivity(el);
+    // Never occlude sensitive financial or auth fields if they are in the viewport
+    if (!isSensitive && isElementOccluded(el, rect)) return; // occluded or covered by modal/backdrop
+
     let selector = buildStableSelector(el);
     if (seen.has(selector)) {
       // Ensure selector uniqueness so distinct interactive buttons/links are never discarded
@@ -95,7 +100,6 @@ export function buildRegistry(): ElementRecord[] {
       height: Math.round(rect.height),
     };
 
-    const isSensitive = detectSensitivity(el);
     const ariaLabel = el.getAttribute('aria-label') ||
                       el.getAttribute('aria-labelledby')
                         ? resolveAriaLabelledby(el)
@@ -121,6 +125,8 @@ export function buildRegistry(): ElementRecord[] {
     registry.set(elementId, { record, element: el });
     records.push(record);
   });
+
+
 
   console.log(`[ElementRegistry] Built ${records.length} elements`);
   return records;

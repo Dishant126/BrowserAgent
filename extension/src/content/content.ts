@@ -25,6 +25,8 @@ import { extractA11yTree, formatA11yForLLM } from './accessibility';
 import { getAdapter, getSiteStatus } from '../adapters/adapter-registry';
 import { injectFloatingPanel, toggleFloatingPanel, removeFloatingPanel, isFloatingPanelVisible, updatePanelStats } from './floating-panel';
 import { updateAgentBorder, removeAgentBorder } from './agent-border';
+import { maskLifecycleManager } from './mask-lifecycle';
+import { getActiveModal, isEntityOccluded } from '../utils/dom-visibility';
 import { SpeechRecognitionManager } from '../utils/speech-recognition';
 import { voiceOutputManager } from '../utils/speech-synthesis';
 import type {
@@ -51,7 +53,6 @@ export interface ClientMetrics {
 
 let currentSettings: PrivacySettings = DEFAULT_SETTINGS;
 let currentEntities: PIIEntity[] = [];
-let overlayContainer: HTMLDivElement | null = null;
 let auditLog: AuditEvent[] = [];
 let lastStateHash = '';
 let lastAnalysisContext: SanitizedContext | null = null;
@@ -259,7 +260,8 @@ function toCleanSerializableEntities(entities: PIIEntity[]): any[] {
 
 async function analyzePage(
   forceRefresh = false,
-  rawScreenshot?: string
+  rawScreenshot?: string,
+  stepId: number | string = 1
 ): Promise<{ context: SanitizedContext; metrics: ClientMetrics }> {
   const t0 = Date.now();
 
@@ -418,7 +420,8 @@ async function analyzePage(
   // ── Stage 5: Combine + apply policy ────────────────────────────────────────
   // YOLOS entities merged in after existing detectors — all feed the same redaction pipeline
   const allEntities = [...domEntities, ...domTextEntities, ...textEntities, ...ocrEntities, ...faceEntities, ...yolosEntities];
-  const appliedEntities = applyPolicy(allEntities, currentSettings);
+  const appliedEntities = applyPolicy(allEntities, currentSettings)
+    .filter(e => !isEntityOccluded(e));
   currentEntities = appliedEntities;
 
   // ── Stage 6: Redaction (DOM, Text & Pixel Screenshot) ────────────────────────
@@ -491,7 +494,7 @@ async function analyzePage(
   // ── Stage 7: Overlay rendering ────────────────────────────────────────────────
   const t_overlay = Date.now();
   try {
-    renderOverlay(appliedEntities);
+    maskLifecycleManager.createMasks(appliedEntities, stepId);
     if (isFloatingPanelVisible()) {
       updatePanelStats(appliedEntities.length);
     }
@@ -565,164 +568,14 @@ async function analyzePage(
   return { context, metrics };
 }
 
-// ── VISUAL OVERLAY ─────────────────────────────────────────────────────────────
+// ── VISUAL OVERLAY (MANAGED VIA MASK LIFECYCLE MANAGER) ───────────────────────
 
-interface TrackedOverlayBox {
-  boxEl: HTMLDivElement;
-  targetEl?: HTMLElement | Element | null;
-  isFixed: boolean;
-  baseBbox: BoundingBox;
+function renderOverlay(entities: PIIEntity[], stepId: number | string = 1): void {
+  maskLifecycleManager.createMasks(entities, stepId);
 }
 
-let trackedOverlayBoxes: TrackedOverlayBox[] = [];
-let scrollRafId: number | null = null;
-let scrollListenerRegistered = false;
-
-function updateOverlayPositions(): void {
-  if (!overlayContainer || trackedOverlayBoxes.length === 0) return;
-
-  for (const item of trackedOverlayBoxes) {
-    if (!item.targetEl || !document.body.contains(item.targetEl)) {
-      item.boxEl.style.display = 'none';
-      continue;
-    }
-
-    const rect = item.targetEl.getBoundingClientRect();
-    if (rect.width === 0 && rect.height === 0) {
-      item.boxEl.style.display = 'none';
-      continue;
-    }
-    item.boxEl.style.display = 'block';
-
-    const isFixed = item.isFixed || isElementFixedOrSticky(item.targetEl);
-    if (isFixed) {
-      item.boxEl.style.position = 'fixed';
-      item.boxEl.style.left = `${Math.round(rect.left)}px`;
-      item.boxEl.style.top = `${Math.round(rect.top)}px`;
-    } else {
-      item.boxEl.style.position = 'absolute';
-      item.boxEl.style.left = `${Math.round(rect.left + window.scrollX)}px`;
-      item.boxEl.style.top = `${Math.round(rect.top + window.scrollY)}px`;
-    }
-    item.boxEl.style.width = `${Math.round(rect.width)}px`;
-    item.boxEl.style.height = `${Math.round(rect.height)}px`;
-  }
-}
-
-function onScrollOrResize(): void {
-  if (scrollRafId !== null) cancelAnimationFrame(scrollRafId);
-  scrollRafId = requestAnimationFrame(() => {
-    scrollRafId = null;
-    updateOverlayPositions();
-  });
-}
-
-function renderOverlay(entities: PIIEntity[]): void {
-  clearOverlay();
-
-  overlayContainer = document.createElement('div');
-  overlayContainer.id = '__privacy-agent-overlay__';
-  overlayContainer.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;z-index:2147483647;';
-  document.body.appendChild(overlayContainer);
-
-  const boxes = buildOverlayBoxes(entities);
-  for (let i = 0; i < boxes.length; i++) {
-    const { bbox, label, color, targetElement, isFixed: boxIsFixed } = boxes[i];
-    const entity = entities[i];
-
-    let targetEl: HTMLElement | Element | null = targetElement || null;
-    if (!targetEl && entity?.domSelector) {
-      try { targetEl = document.querySelector(entity.domSelector); } catch {}
-    }
-    if (!targetEl && bbox) {
-      const vpX = bbox.x - window.scrollX + bbox.width / 2;
-      const vpY = bbox.y - window.scrollY + bbox.height / 2;
-      if (vpX >= 0 && vpX <= window.innerWidth && vpY >= 0 && vpY <= window.innerHeight) {
-        const probe = document.elementFromPoint(vpX, vpY);
-        if (probe && !probe.closest('#__privacy-agent-overlay__, #__privsight-host__')) {
-          if (entity?.type === 'face') {
-            targetEl = probe.closest('img, canvas, svg, [class*="avatar"], [class*="profile-photo"], [class*="user-photo"], [itemprop="image"]') || null;
-          } else {
-            targetEl = probe.closest('input, textarea, select, [contenteditable="true"]') || null;
-          }
-        }
-      }
-    }
-
-    // Validate targetEl: NEVER use layout containers (div, section, main, body) or oversized elements
-    if (targetEl) {
-      const r = targetEl.getBoundingClientRect();
-      const isLayoutTag = ['HTML', 'BODY', 'MAIN', 'SECTION', 'ARTICLE', 'DIV'].includes(targetEl.tagName.toUpperCase());
-      const isOversized = r.width > window.innerWidth * 0.4 || r.height > window.innerHeight * 0.4 || (entity?.type === 'face' && (r.width > 350 || r.height > 350));
-      if (isOversized || (isLayoutTag && entity?.type === 'face')) {
-        targetEl = null;
-      }
-    }
-
-    // If using bbox directly for a face, discard anomalous huge boxes
-    if (!targetEl && entity?.type === 'face' && (bbox.width > 350 || bbox.height > 350 || (bbox.width * bbox.height > window.innerWidth * window.innerHeight * 0.15))) {
-      continue; // Skip anomalous false-positive face boxes that would cover large portions of the screen
-    }
-
-    const isFixed = boxIsFixed || (targetEl ? isElementFixedOrSticky(targetEl) : false);
-
-    let boxLeft = 0;
-    let boxTop = 0;
-    let boxWidth = 0;
-    let boxHeight = 0;
-
-    if (targetEl) {
-      const rect = targetEl.getBoundingClientRect();
-      boxLeft = isFixed ? Math.round(rect.left) : Math.round(rect.left + window.scrollX);
-      boxTop = isFixed ? Math.round(rect.top) : Math.round(rect.top + window.scrollY);
-      boxWidth = Math.round(rect.width);
-      boxHeight = Math.round(rect.height);
-    } else {
-      boxLeft = bbox.x;
-      boxTop = bbox.y;
-      boxWidth = bbox.width;
-      boxHeight = bbox.height;
-    }
-
-    // Never blur if the box is abnormally large (more than 40% of viewport in either dimension)
-    const isReasonablySized = boxWidth <= window.innerWidth * 0.4 && boxHeight <= window.innerHeight * 0.4 && boxWidth <= 400 && boxHeight <= 400;
-    const isSensitive = !entity || entity.sensitivity === 'CRITICAL' || entity.sensitivity === 'HIGH' || entity.type === 'face' || entity.type === 'email' || entity.type === 'password' || entity.type === 'phone' || entity.type === 'name';
-    const blurStyle = (isSensitive && isReasonablySized) ? 'backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);' : '';
-    const posStyle = isFixed ? 'position:fixed;' : 'position:absolute;';
-
-    const box = document.createElement('div');
-    box.style.cssText = `${posStyle}left:${boxLeft}px;top:${boxTop}px;width:${boxWidth}px;height:${boxHeight}px;border:2px solid ${color};background:${color}25;${blurStyle}pointer-events:none;border-radius:4px;box-sizing:border-box;z-index:2147483640;`;
-
-    const lbl = document.createElement('div');
-    lbl.style.cssText = `position:absolute;top:-20px;left:0;background:${color};color:#fff;font:bold 10px monospace;padding:2px 6px;border-radius:3px;white-space:nowrap;pointer-events:none;`;
-    lbl.textContent = label;
-    box.appendChild(lbl);
-
-    overlayContainer.appendChild(box);
-    trackedOverlayBoxes.push({
-      boxEl: box,
-      targetEl,
-      isFixed,
-      baseBbox: bbox,
-    });
-  }
-
-  if (!scrollListenerRegistered) {
-    window.addEventListener('scroll', onScrollOrResize, { passive: true, capture: true });
-    window.addEventListener('resize', onScrollOrResize, { passive: true });
-    document.addEventListener('scroll', onScrollOrResize, { passive: true, capture: true });
-    scrollListenerRegistered = true;
-  }
-}
-
-function clearOverlay(): void {
-  trackedOverlayBoxes = [];
-  if (scrollRafId !== null) {
-    cancelAnimationFrame(scrollRafId);
-    scrollRafId = null;
-  }
-  overlayContainer?.remove();
-  overlayContainer = null;
+function clearOverlay(reason = 'explicit_clear'): void {
+  maskLifecycleManager.cleanupMasks(reason);
 }
 
 // ── AUDIT LOGGING ─────────────────────────────────────────────────────────────
@@ -794,6 +647,10 @@ function handleStopVoiceInput(): void {
 // ── MESSAGE HANDLER ────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendResponse) => {
+  // Never let sub-frames (invisible tracking scripts, Stripe fraud frames, etc.) handle tab-level page analysis or actions
+  if (window !== window.top && (message.type === 'ANALYZE_PAGE' || message.type === 'ACTION_REQUEST')) {
+    return;
+  }
   (async () => {
     switch (message.type) {
 
@@ -803,7 +660,7 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
             setTimeout(() => reject(new Error('analyzePage timeout')), 8000)
           );
           const { context, metrics } = await Promise.race([
-            analyzePage(message.forceRefresh === true, message.screenshot),
+            analyzePage(message.forceRefresh === true, message.screenshot, message.stepId),
             timeoutPromise
           ]);
           sendResponse({
@@ -866,7 +723,13 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
           // For now: auto-approve navigate in demo mode
         }
 
-        const result = await executeAction(action);
+        maskLifecycleManager.onActionExecuting(action);
+        let result: any;
+        try {
+          result = await executeAction(action);
+        } finally {
+          maskLifecycleManager.onActionCompleted(action);
+        }
         emitAuditEvent('action_executed', { detail: `${action.action} → ${action.reason}` });
         sendResponse(result);
         break;
@@ -885,7 +748,7 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
       }
 
       case 'CLEAR_OVERLAYS': {
-        clearOverlay();
+        maskLifecycleManager.cleanupMasks((message as any).reason || 'message_clear', (message as any).stepId);
         checkAndResetIfNeeded();
         sendResponse({ ok: true });
         break;
@@ -938,6 +801,9 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
       case 'TASK_STATE_CHANGE': {
         const state = (message as any).taskState;
         updateAgentBorder(state);
+        if (state === 'IDLE' || state === 'COMPLETED' || state === 'ERROR') {
+          maskLifecycleManager.cleanupMasks('task_state_' + state);
+        }
         sendResponse({ ok: true });
         break;
       }
@@ -945,6 +811,9 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
       case 'STATUS_UPDATE': {
         const state = (message as any).taskState || (message as any).status;
         updateAgentBorder(state);
+        if (state === 'IDLE' || state === 'COMPLETED' || state === 'ERROR') {
+          maskLifecycleManager.cleanupMasks('status_update_' + state);
+        }
         sendResponse({ ok: true });
         break;
       }
@@ -960,6 +829,7 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, _sender, sendRe
 
       case 'TASK_DONE': {
         removeAgentBorder();
+        maskLifecycleManager.cleanupMasks('task_done');
         sendResponse({ ok: true });
         break;
       }
@@ -974,16 +844,17 @@ function handleSpaNavigation() {
   if (location.href !== lastRecordedHref) {
     console.log('[PrivacyAgent] SPA Navigation detected:', lastRecordedHref, '->', location.href);
     lastRecordedHref = location.href;
-    clearOverlay();
+    maskLifecycleManager.onNavigation();
     checkAndResetIfNeeded();
   }
 }
 
 window.addEventListener('popstate', handleSpaNavigation);
 window.addEventListener('hashchange', handleSpaNavigation);
-window.addEventListener('turbo:render', () => { clearOverlay(); checkAndResetIfNeeded(); });
-window.addEventListener('turbo:load', () => { clearOverlay(); checkAndResetIfNeeded(); });
-document.addEventListener('pjax:end', () => { clearOverlay(); checkAndResetIfNeeded(); });
+window.addEventListener('turbo:render', () => { maskLifecycleManager.onNavigation(); checkAndResetIfNeeded(); });
+window.addEventListener('turbo:load', () => { maskLifecycleManager.onNavigation(); checkAndResetIfNeeded(); });
+document.addEventListener('pjax:end', () => { maskLifecycleManager.onNavigation(); checkAndResetIfNeeded(); });
+window.addEventListener('beforeunload', () => { maskLifecycleManager.cleanupMasks('unload'); });
 
 try {
   const origPush = history.pushState;
@@ -1036,3 +907,39 @@ try {
     }
   });
 } catch {}
+
+// ── CHILD IFRAME AUTO-PROTECTION (RAZORPAY / STRIPE / PAYMENT GATEWAYS) ────────
+if (window !== window.top) {
+  const autoProtectIframe = () => {
+    try {
+      const entities = [
+        ...detectPIIFromDOM(currentSettings),
+        ...detectPIIFromDOMText(currentSettings),
+      ];
+      if (entities.length > 0) {
+        maskLifecycleManager.createMasks(entities);
+      }
+    } catch {}
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', autoProtectIframe);
+  } else {
+    autoProtectIframe();
+  }
+
+  document.addEventListener('input', autoProtectIframe, true);
+  document.addEventListener('change', autoProtectIframe, true);
+  document.addEventListener('focusin', autoProtectIframe, true);
+
+  try {
+    const frameObserver = new MutationObserver(() => {
+      autoProtectIframe();
+    });
+    frameObserver.observe(document.documentElement || document.body, {
+      childList: true,
+      subtree: true,
+    });
+  } catch {}
+}
+
