@@ -16,8 +16,8 @@
 import type { PIIEntity, BoundingBox } from '../utils/types';
 
 const COLORS = {
-  CRITICAL: { fill: '#1a1a1a', border: '#dc2626', text: '#ff4444', badge: '#dc2626' },
-  HIGH:     { fill: 'rgba(220,38,38,0.12)', border: '#f97316', text: '#ffffff', badge: '#f97316' },
+  CRITICAL: { fill: 'rgba(249,115,22,0.30)', border: '#f97316', text: '#ffffff', badge: '#f97316' },
+  HIGH:     { fill: 'rgba(249,115,22,0.30)', border: '#f97316', text: '#ffffff', badge: '#f97316' },
   MEDIUM:   { fill: 'rgba(202,138,4,0.15)', border: '#ca8a04', text: '#ffffff', badge: '#ca8a04' },
   LOW:      { fill: 'rgba(37,99,235,0.12)', border: '#2563eb', text: '#ffffff', badge: '#2563eb' },
 };
@@ -229,9 +229,13 @@ export function applyRedactionsToCanvas(
   // Apply roundRect polyfill for Chrome < 99
   polyfillRoundRect(ctx);
 
-  // DPR: captureVisibleTab gives physical pixels. Bboxes are CSS pixels.
-  // Conversion: cssPixel * dpr = physicalPixel (screenshot coordinate)
-  const dpr = devicePixelRatio;
+  // Compute true scaling factor between CSS pixels (bbox) and physical screenshot canvas.
+  // Using actual canvas-to-viewport ratio prevents coordinate drift when captureVisibleTab
+  // dimensions do not match window.innerWidth * devicePixelRatio.
+  const winW = (typeof window !== 'undefined' && window.innerWidth) ? window.innerWidth : (canvas.width / (devicePixelRatio || 1));
+  const winH = (typeof window !== 'undefined' && window.innerHeight) ? window.innerHeight : (canvas.height / (devicePixelRatio || 1));
+  const scaleX = canvas.width / winW;
+  const scaleY = canvas.height / winH;
 
   // Sort: CRITICAL first (so heavy redaction applied before lighter ones)
   const sorted = [...entities].filter(e => e.bbox).sort((a, b) => {
@@ -278,11 +282,11 @@ export function applyRedactionsToCanvas(
 
     // Convert CSS-pixel page coordinates → physical screenshot pixel coordinates
     // Step 1: subtract scroll to get viewport-relative CSS pixels
-    // Step 2: multiply by dpr to get physical screenshot pixels
-    const vpX = (entity.bbox.x - scrollX) * dpr;
-    const vpY = (entity.bbox.y - scrollY) * dpr;
-    const vpW = entity.bbox.width * dpr;
-    const vpH = entity.bbox.height * dpr;
+    // Step 2: multiply by scaleX/scaleY to get exact physical screenshot pixels
+    const vpX = (entity.bbox.x - scrollX) * scaleX;
+    const vpY = (entity.bbox.y - scrollY) * scaleY;
+    const vpW = entity.bbox.width * scaleX;
+    const vpH = entity.bbox.height * scaleY;
 
     // Skip if fully outside the canvas
     if (vpX + vpW < 0 || vpY + vpH < 0) continue;
@@ -301,6 +305,9 @@ export function applyRedactionsToCanvas(
 
     switch (entity.sensitivity) {
       case 'CRITICAL':
+        // Blur and pixelate region first to guarantee zero visual leakage
+        blurRegion(ctx, clampedBbox, 20);
+        pixelateRegion(ctx, clampedBbox, 10);
         // Solid black fill — data is completely hidden
         ctx.fillStyle = colors.fill;
         ctx.fillRect(cx, cy, cw, ch);
@@ -352,26 +359,29 @@ export function applyRedactionsToCanvas(
         break;
     }
 
-    // Draw top badge — position it inside canvas, right-clipped
-    // If near the top edge, draw badge INSIDE the redacted region instead
-    const badgeLabel = `${entity.type.toUpperCase()} — REDACTED`;
-    ctx.save();
-    ctx.font = 'bold 10px monospace';
-    const textW = ctx.measureText(badgeLabel).width + 12;
-    const badgeX = Math.min(Math.max(0, cx), canvas.width - textW - 2);
-    const spaceAbove = cy;
-    const badgeH = 16;
-    // If there's room above the box, draw above; otherwise draw inside at top
-    const badgeY = spaceAbove >= badgeH + 2
-      ? cy - badgeH - 2
-      : cy + 2;
-    ctx.fillStyle = colors.badge;
-    ctx.beginPath();
-    (ctx as any).roundRect(badgeX, badgeY, textW, badgeH, 3);
-    ctx.fill();
-    ctx.fillStyle = '#fff';
-    ctx.fillText(badgeLabel, badgeX + 6, badgeY + 11);
-    ctx.restore();
+    // Draw top badge — position it above box inside canvas
+    // If there is an entity directly above (e.g. Card Number above Expiry/CVV), suppress badge to avoid clutter/overlap
+    const hasEntityDirectlyAbove = mergedEntities.some(
+      other => other !== entity && other.bbox && Math.abs((other.bbox.y + other.bbox.height - scrollY) * scaleY - cy) < 10
+    );
+    if (!hasEntityDirectlyAbove) {
+      const badgeLabel = `${entity.type.toUpperCase()} — REDACTED`;
+      ctx.save();
+      ctx.font = 'bold 10px monospace';
+      const textW = ctx.measureText(badgeLabel).width + 12;
+      const badgeX = Math.min(Math.max(0, cx), canvas.width - textW - 2);
+      const spaceAbove = cy;
+      const badgeH = 16;
+      if (spaceAbove >= badgeH + 2) {
+        ctx.fillStyle = colors.badge;
+        ctx.beginPath();
+        (ctx as any).roundRect(badgeX, cy - badgeH - 2, textW, badgeH, 3);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.fillText(badgeLabel, badgeX + 6, cy - 4);
+      }
+      ctx.restore();
+    }
     count++;
   }
 

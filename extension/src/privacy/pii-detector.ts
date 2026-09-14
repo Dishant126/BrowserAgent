@@ -228,23 +228,27 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
       const cleanDigits = rawVal.replace(/\D/g, '');
       if (cleanDigits.length >= 13 && cleanDigits.length <= 19 && enabledTypes.has('credit_card')) {
         detectedType = 'credit_card';
-        confidence = 0.96;
+        confidence = 0.98;
       } else if (EMAIL_REGEX.test(rawVal) && enabledTypes.has('email')) {
         detectedType = 'email';
         confidence = 0.98;
       } else if (PHONE_REGEX.test(rawVal) && enabledTypes.has('phone')) {
         detectedType = 'phone';
         confidence = 0.95;
-      } else if ((/^\d{3,4}$|^\.{3,4}$|^\*{3,4}$/.test(rawVal) && (/cvv|cvc|csc|security|code/i.test(combinedDescriptor) || input.maxLength === 3 || input.maxLength === 4)) && enabledTypes.has('cvv')) {
+      } else if (/^\d{3,4}$|^\.{3,4}$|^\*{3,4}$|^•{3,4}$/.test(rawVal) && enabledTypes.has('cvv') && (/cvv|cvc|csc|security.?code|verification/i.test(combinedDescriptor) || input.maxLength === 3 || input.maxLength === 4 || /^\.{3,4}$|^\*{3,4}$|^•{3,4}$/.test(rawVal))) {
         detectedType = 'cvv';
-        confidence = 0.97;
+        confidence = 0.98;
       } else if (/^(?:0[1-9]|1[0-2])\s*\/\s*(?:2\d|3\d)$/.test(rawVal) && enabledTypes.has('credit_card')) {
         detectedType = 'credit_card';
-        confidence = 0.92;
+        confidence = 0.95;
       } else if (/^\d{4,8}$/.test(cleanDigits) && /otp|passcode|verification/i.test(combinedDescriptor) && enabledTypes.has('password')) {
         detectedType = 'password';
         confidence = 0.95;
       }
+    }
+
+    if (detectedType === 'credit_card' || detectedType === 'cvv') {
+      confidence = Math.max(confidence, 0.98);
     }
 
     if (detectedType && enabledTypes.has(detectedType)) {
@@ -350,7 +354,8 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
             if (digits.length >= 13 && digits.length <= 19 && enabledTypes.has('credit_card')) fDetected = 'credit_card';
             else if (EMAIL_REGEX.test(fVal) && enabledTypes.has('email')) fDetected = 'email';
             else if (PHONE_REGEX.test(fVal) && enabledTypes.has('phone')) fDetected = 'phone';
-            else if (/^\d{3,4}$|^\.{3,4}$/.test(fVal) && /cvv|cvc|security/i.test(fCombined)) fDetected = 'cvv';
+            else if ((/^\d{3,4}$|^\.{3,4}$|^\*{3,4}$|^•{3,4}$/.test(fVal) || /cvv|cvc|security/i.test(fCombined)) && (/cvv|cvc|security/i.test(fCombined) || fInput.maxLength === 3 || fInput.maxLength === 4 || /^\.{3,4}$|^\*{3,4}$|^•{3,4}$/.test(fVal))) fDetected = 'cvv';
+            else if (/^(?:0[1-9]|1[0-2])\s*\/\s*(?:2\d|3\d)$/.test(fVal) && enabledTypes.has('credit_card')) fDetected = 'credit_card';
           }
 
           if (fDetected && enabledTypes.has(fDetected)) {

@@ -136,15 +136,15 @@ export class MaskLifecycleManager {
         boxWidth = Math.round(rect.width);
         boxHeight = Math.round(rect.height);
       } else {
-        boxLeft = bbox.x;
-        boxTop = bbox.y;
-        boxWidth = bbox.width;
-        boxHeight = bbox.height;
+        boxLeft = isFixed ? Math.round(bbox.x - window.scrollX) : Math.round(bbox.x);
+        boxTop = isFixed ? Math.round(bbox.y - window.scrollY) : Math.round(bbox.y);
+        boxWidth = Math.round(bbox.width);
+        boxHeight = Math.round(bbox.height);
       }
 
-      // Never blur if the box is abnormally large (more than 40% of viewport in either dimension)
-      const isReasonablySized = boxWidth <= window.innerWidth * 0.4 && boxHeight <= window.innerHeight * 0.4 && boxWidth <= 400 && boxHeight <= 400;
-      const isSensitive = !entity || entity.sensitivity === 'CRITICAL' || entity.sensitivity === 'HIGH' || entity.type === 'face' || entity.type === 'email' || entity.type === 'password' || entity.type === 'phone' || entity.type === 'name';
+      // Never blur if the box is abnormally large (more than 60% of viewport in either dimension)
+      const isReasonablySized = boxWidth <= window.innerWidth * 0.6 && boxHeight <= window.innerHeight * 0.6 && boxWidth <= 600 && boxHeight <= 600;
+      const isSensitive = !entity || entity.sensitivity === 'CRITICAL' || entity.sensitivity === 'HIGH' || entity.type === 'face' || entity.type === 'email' || entity.type === 'password' || entity.type === 'credit_card' || entity.type === 'cvv' || entity.type === 'phone' || entity.type === 'name';
       const blurStyle = (isSensitive && isReasonablySized) ? 'backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);' : '';
       const posStyle = isFixed ? 'position:fixed;' : 'position:absolute;';
 
@@ -154,10 +154,22 @@ export class MaskLifecycleManager {
       box.dataset.privsightStepId = String(this.currentStepId);
       box.style.cssText = `${posStyle}left:${boxLeft}px;top:${boxTop}px;width:${boxWidth}px;height:${boxHeight}px;border:2px solid ${color};background:${color}25;${blurStyle}pointer-events:none;border-radius:4px;box-sizing:border-box;z-index:2147483640;`;
 
-      const lbl = document.createElement('div');
-      lbl.style.cssText = `position:absolute;top:-20px;left:0;background:${color};color:#fff;font:bold 10px monospace;padding:2px 6px;border-radius:3px;white-space:nowrap;pointer-events:none;`;
-      lbl.textContent = label;
-      box.appendChild(lbl);
+      // Prevent top badge label from overlapping another mask placed directly above it (e.g. Expiry/CVV under Card Number)
+      const hasBoxAbove = boxes.some((other, oi) => oi !== i && Math.abs((other.bbox.y + other.bbox.height) - bbox.y) < 8);
+      if (!hasBoxAbove) {
+        const lbl = document.createElement('div');
+        lbl.style.cssText = `position:absolute;top:-20px;left:0;background:${color};color:#fff;font:bold 10px monospace;padding:2px 6px;border-radius:3px;white-space:nowrap;pointer-events:none;`;
+        lbl.textContent = label;
+        box.appendChild(lbl);
+      }
+
+      // Add centered placeholder text inside the blur box for immediate visual clarity
+      if (entity?.placeholder && isReasonablySized && boxWidth >= 50) {
+        const centerLbl = document.createElement('div');
+        centerLbl.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#ffffff;font:bold 11px monospace;text-shadow:0 1px 3px rgba(0,0,0,0.8);pointer-events:none;letter-spacing:0.5px;';
+        centerLbl.textContent = entity.placeholder;
+        box.appendChild(centerLbl);
+      }
 
       this.overlayContainer.appendChild(box);
 

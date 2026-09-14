@@ -829,6 +829,98 @@ async function runTests() {
     assert(manager.getActiveMasksCount() === 0, 'Clean state after Test 12');
   }
 
+  // ──────────────────────────────────────────────────────────────────────────
+  console.log('\n[TEST 13] Razorpay child iframe Card Number and CVV detection, coordinate relay, and blur styling');
+  {
+    // 1. Create a simulated Razorpay checkout iframe in parent page
+    const rzpIframe = new MockElement('iframe');
+    rzpIframe.className = 'razorpay-checkout-frame';
+    rzpIframe.attributes = { src: 'https://api.razorpay.com/v1/checkout/public' };
+    rzpIframe.getBoundingClientRect = () => ({ left: 200, top: 100, width: 700, height: 450, right: 900, bottom: 550 });
+    document.body.appendChild(rzpIframe);
+
+    // 2. Child iframe internal inputs (local coordinates inside the iframe)
+    const childCardInput = new MockElement('input');
+    childCardInput.attributes = { placeholder: 'Card Number', value: '4528 9012 3456 7890', autocomplete: 'cc-number' };
+    childCardInput.getBoundingClientRect = () => ({ left: 280, top: 160, width: 350, height: 40 });
+
+    const childExpInput = new MockElement('input');
+    childExpInput.attributes = { placeholder: 'MM / YY', value: '12 / 28', autocomplete: 'cc-exp' };
+    childExpInput.getBoundingClientRect = () => ({ left: 280, top: 220, width: 160, height: 40 });
+
+    const childCvvInput = new MockElement('input');
+    childCvvInput.attributes = { placeholder: 'CVV', value: '...', autocomplete: 'cc-csc' };
+    childCvvInput.getBoundingClientRect = () => ({ left: 460, top: 220, width: 170, height: 40 });
+
+    // 3. Verify detection logic recognizes credit_card and cvv
+    const isCard = /card|cc[-_]?number/i.test(childCardInput.attributes.placeholder + ' ' + childCardInput.attributes.autocomplete);
+    const isExp = /exp|expiry|mm\s*\/?\s*yy/i.test(childExpInput.attributes.placeholder + ' ' + childExpInput.attributes.autocomplete);
+    const isCvv = /cvv|cc[-_]?csc/i.test(childCvvInput.attributes.placeholder + ' ' + childCvvInput.attributes.autocomplete) || childCvvInput.attributes.value === '...';
+
+    assert(isCard === true, 'Child Card input detected as credit_card');
+    assert(isExp === true, 'Child Expiry input detected as credit_card');
+    assert(isCvv === true, 'Child CVV input detected as cvv');
+
+    // 4. Translate child coordinates -> parent window coordinates
+    const fRect = rzpIframe.getBoundingClientRect();
+    const parentEntities = [
+      {
+        id: 'child-card-01',
+        type: 'credit_card',
+        sensitivity: 'CRITICAL',
+        targetElement: childCardInput,
+        bbox: {
+          x: fRect.left + childCardInput.getBoundingClientRect().left,
+          y: fRect.top + childCardInput.getBoundingClientRect().top,
+          width: childCardInput.getBoundingClientRect().width,
+          height: childCardInput.getBoundingClientRect().height,
+        }
+      },
+      {
+        id: 'child-exp-01',
+        type: 'credit_card',
+        sensitivity: 'CRITICAL',
+        targetElement: childExpInput,
+        bbox: {
+          x: fRect.left + childExpInput.getBoundingClientRect().left,
+          y: fRect.top + childExpInput.getBoundingClientRect().top,
+          width: childExpInput.getBoundingClientRect().width,
+          height: childExpInput.getBoundingClientRect().height,
+        }
+      },
+      {
+        id: 'child-cvv-01',
+        type: 'cvv',
+        sensitivity: 'CRITICAL',
+        targetElement: childCvvInput,
+        bbox: {
+          x: fRect.left + childCvvInput.getBoundingClientRect().left,
+          y: fRect.top + childCvvInput.getBoundingClientRect().top,
+          width: childCvvInput.getBoundingClientRect().width,
+          height: childCvvInput.getBoundingClientRect().height,
+        }
+      }
+    ];
+
+    assert(parentEntities[0].bbox.x === 480, 'Card Number correctly mapped to parent window X: 480');
+    assert(parentEntities[0].bbox.y === 260, 'Card Number correctly mapped to parent window Y: 260');
+    assert(parentEntities[2].bbox.x === 660, 'CVV correctly mapped to parent window X: 660');
+    assert(parentEntities[2].bbox.y === 320, 'CVV correctly mapped to parent window Y: 320');
+
+    // 5. Create DOM masks and verify blur styling
+    manager.createMasks(parentEntities, 5);
+    assert(manager.getActiveMasksCount() === 3, '3 masks rendered for Card Number, Expiry, and CVV');
+
+    // Check that mask handles have blur in style
+    for (const handle of manager.activeMasks.values()) {
+      assert(handle.boxEl.style.cssText.includes('backdrop-filter:blur(8px)'), 'Mask element has backdrop-filter:blur(8px) applied');
+    }
+
+    manager.cleanupMasks('test13_end');
+    document.body.removeChild(rzpIframe);
+    assert(manager.getActiveMasksCount() === 0, 'Clean state after Test 13');
+  }
+
   console.log('\n============================================================');
   console.log(`TEST RESULTS: ${passed} PASSED, ${failed} FAILED`);
   console.log('============================================================\n');

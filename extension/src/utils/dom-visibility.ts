@@ -215,6 +215,12 @@ export function isElementOccluded(el: Element, rect?: DOMRect | BoundingBox): bo
     parent = parent.parentElement;
   }
 
+  // If inside a child iframe (e.g. payment checkout iframe), the elements inside this document
+  // are the active checkout inputs themselves; they are never occluded by parent modals.
+  if (window !== window.top) {
+    return false;
+  }
+
   // 3. Active modal containment check:
   // If active modals exist, elements outside all active modals are occluded by the modal/backdrop
   const activeModals = getActiveModals();
@@ -222,19 +228,9 @@ export function isElementOccluded(el: Element, rect?: DOMRect | BoundingBox): bo
     const vpLeft = (r as any).left !== undefined ? (r as any).left : (r as any).x - window.scrollX;
     const vpTop = (r as any).top !== undefined ? (r as any).top : (r as any).y - window.scrollY;
 
-    const insideModal = activeModals.find(m => {
-      if (m === el || m.contains(el)) return true;
-      // Coordinate containment (vital for iframes, shadow DOM, or modal overlays)
-      const mRect = m.getBoundingClientRect();
-      return (
-        vpLeft >= mRect.left - 25 &&
-        vpLeft + r.width <= mRect.right + 25 &&
-        vpTop >= mRect.top - 25 &&
-        vpTop + r.height <= mRect.bottom + 25
-      );
-    });
+    const insideModal = activeModals.find(m => m === el || m.contains(el));
 
-    if (!insideModal) {
+    if (activeModals.length > 0 && !insideModal) {
       // Element is in the background page behind the active modal -> OCCLUDED!
       return true;
     }

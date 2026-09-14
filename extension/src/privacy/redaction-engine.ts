@@ -4,7 +4,7 @@
 import type { PIIEntity, UIElement, BoundingBox } from '../utils/types';
 
 const SENSITIVITY_COLORS: Record<string, string> = {
-  CRITICAL: '#dc2626', HIGH: '#f57c00', MEDIUM: '#ca8a04', LOW: '#2563eb',
+  CRITICAL: '#f97316', HIGH: '#f97316', MEDIUM: '#ca8a04', LOW: '#2563eb',
 };
 
 export interface OverlayBox {
@@ -83,14 +83,19 @@ export function redactScreenshot(canvas: HTMLCanvasElement, entities: PIIEntity[
   const canvasW = canvas.width;
   const canvasH = canvas.height;
 
+  const winW = (typeof window !== 'undefined' && window.innerWidth) ? window.innerWidth : canvasW;
+  const winH = (typeof window !== 'undefined' && window.innerHeight) ? window.innerHeight : canvasH;
+  const scaleX = canvasW / winW;
+  const scaleY = canvasH / winH;
+
   for (const entity of entities) {
     if (!entity.bbox) continue;
 
-    // Viewport-relative coordinates
-    const vx = Math.round(entity.bbox.x - scrollX);
-    const vy = Math.round(entity.bbox.y - scrollY);
-    const vw = Math.round(entity.bbox.width);
-    const vh = Math.round(entity.bbox.height);
+    // Viewport-relative coordinates scaled to canvas
+    const vx = Math.round((entity.bbox.x - scrollX) * scaleX);
+    const vy = Math.round((entity.bbox.y - scrollY) * scaleY);
+    const vw = Math.round(entity.bbox.width * scaleX);
+    const vh = Math.round(entity.bbox.height * scaleY);
 
     // Skip regions outside visible canvas
     if (vx + vw <= 0 || vy + vh <= 0 || vx >= canvasW || vy >= canvasH) continue;
@@ -106,16 +111,21 @@ export function redactScreenshot(canvas: HTMLCanvasElement, entities: PIIEntity[
 
     if (entity.redactionMethod === 'blur' || entity.type === 'face') {
       blurCanvasRegion(ctx, clampedBbox, 25);
-    } else if (entity.type === 'password') {
-      // Solid blackout mask for passwords
-      ctx.fillStyle = '#0f172a';
+    } else if (entity.type === 'password' || entity.type === 'credit_card' || entity.type === 'cvv') {
+      // Blur underlying pixels + orange box mask for credentials and payment details
+      blurCanvasRegion(ctx, clampedBbox, 25);
+      ctx.fillStyle = 'rgba(249, 115, 22, 0.30)';
       ctx.fillRect(clampedX, clampedY, clampedW, clampedH);
-      ctx.strokeStyle = '#ef4444';
-      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = '#f97316';
+      ctx.lineWidth = 2;
       ctx.strokeRect(clampedX, clampedY, clampedW, clampedH);
-      ctx.fillStyle = '#fca5a5';
+      ctx.fillStyle = '#ffffff';
       ctx.font = 'bold 10px monospace';
-      ctx.fillText('[PASSWORD REMOVED]', clampedX + 4, clampedY + Math.min(14, clampedH / 2 + 4));
+      const label = entity.placeholder || (entity.type === 'password' ? '[PASSWORD REMOVED]' : `[${entity.type.toUpperCase()} REDACTED]`);
+      const tw = ctx.measureText(label).width;
+      const textX = clampedW > tw ? clampedX + (clampedW - tw) / 2 : clampedX + 2;
+      const textY = clampedY + clampedH / 2 + 4;
+      ctx.fillText(label, textX, textY);
     } else {
       // Solid color mask with placeholder label
       ctx.fillStyle = SENSITIVITY_COLORS[entity.sensitivity] ?? '#6b7280';

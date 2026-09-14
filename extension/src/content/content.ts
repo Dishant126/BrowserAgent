@@ -63,11 +63,60 @@ chrome.storage.local.get(['privacySettings'], (result) => {
   if (result.privacySettings) currentSettings = result.privacySettings;
 });
 
-// Announce site status to background on load
-(function announceSiteStatus() {
-  const status = getSiteStatus(location.href);
-  chrome.runtime.sendMessage({ type: 'SITE_STATUS', siteStatus: status }).catch(() => {});
-})();
+// Announce site status to background on load (top-level frame only)
+if (window === window.top) {
+  (function announceSiteStatus() {
+    const status = getSiteStatus(location.href);
+    chrome.runtime.sendMessage({ type: 'SITE_STATUS', siteStatus: status }).catch(() => {});
+  })();
+}
+
+// Global registry of child iframe PII entities received via postMessage
+const activeIframeEntitiesStore: Map<HTMLIFrameElement, PIIEntity[]> = new Map();
+
+if (window === window.top) {
+  window.addEventListener('message', (ev) => {
+    if (ev.data?.type === '__PRIVSIGHT_IFRAME_PII__' && Array.isArray(ev.data.entities)) {
+      try {
+        const frames = Array.from(document.querySelectorAll<HTMLIFrameElement>('iframe'));
+        const frame = frames.find(f => {
+          try { return f.contentWindow === ev.source; } catch { return false; }
+        });
+        if (!frame) return;
+
+        const fRect = frame.getBoundingClientRect();
+        if (fRect.width <= 0 || fRect.height <= 0) return;
+
+        const mapped: PIIEntity[] = ev.data.entities.map((raw: any) => {
+          const b = raw.bbox;
+          const bbox: BoundingBox = {
+            x: Math.round(fRect.left + (b?.x || 0) + window.scrollX),
+            y: Math.round(fRect.top + (b?.y || 0) + window.scrollY),
+            width: Math.round(b?.width || 0),
+            height: Math.round(b?.height || 0),
+          };
+          return {
+            id: raw.id || `iframe-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+            type: raw.type,
+            confidence: raw.confidence || 0.98,
+            source: 'dom',
+            sensitivity: raw.sensitivity || 'CRITICAL',
+            redactionMethod: 'mask',
+            bbox,
+            isFixed: true,
+            rawValue: raw.rawValue,
+            placeholder: raw.placeholder || (raw.type === 'credit_card' ? '[CARD REDACTED]' : raw.type === 'cvv' ? '[CVV REDACTED]' : '[REDACTED]'),
+            timestamp: Date.now(),
+          };
+        });
+
+        activeIframeEntitiesStore.set(frame, mapped);
+      } catch (err) {
+        console.warn('[PrivacyAgent] Error processing iframe PII message:', err);
+      }
+    }
+  });
+}
 
 // List of video conferencing, meeting, and sensitive communication apps where
 // the agent floating panel must NEVER automatically pop up.
@@ -110,15 +159,17 @@ async function shouldAutoInjectPanel(): Promise<boolean> {
   return !!stored.autoShowFloatingPanel;
 }
 
-shouldAutoInjectPanel().then((shouldInject) => {
-  if (shouldInject) {
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', () => injectFloatingPanel());
-    } else {
-      injectFloatingPanel();
+if (window === window.top) {
+  shouldAutoInjectPanel().then((shouldInject) => {
+    if (shouldInject) {
+      if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', () => injectFloatingPanel());
+      } else {
+        injectFloatingPanel();
+      }
     }
-  }
-});
+  });
+}
 
 // ── STATE HASH ─────────────────────────────────────────────────────────────────
 
@@ -417,9 +468,139 @@ async function analyzePage(
     }
   }
 
+  // ── Stage 4c: Child Iframe PII & Payment Gateway Card Detection ───────────
+  const childIframeEntities: PIIEntity[] = [];
+  try {
+    // Proactively ping child iframes to send fresh PII if not already sent
+    document.querySelectorAll<HTMLIFrameElement>('iframe').forEach(f => {
+      try { f.contentWindow?.postMessage({ type: '__PRIVSIGHT_REQUEST_IFRAME_PII__' }, '*'); } catch {}
+    });
+
+    for (const [frame, ents] of activeIframeEntitiesStore.entries()) {
+      if (document.contains(frame)) {
+        const fRect = frame.getBoundingClientRect();
+        if (fRect.width > 0 && fRect.height > 0) {
+          childIframeEntities.push(...ents);
+        }
+      } else {
+        activeIframeEntitiesStore.delete(frame);
+      }
+    }
+
+    // Payment Gateway Fallback:
+    // If a payment checkout frame (Razorpay, Stripe) is present on page but child iframe PII has not arrived yet,
+    // synthesize exact card input slots for Card Number, Expiry, and CVV fields.
+    const paymentFrames = document.querySelectorAll<HTMLIFrameElement>(
+      'iframe.razorpay-checkout-frame, iframe[src*="razorpay"], iframe[name*="razorpay"], .razorpay-checkout-frame, .razorpay-container iframe, iframe[src*="stripe"]'
+    );
+    paymentFrames.forEach(pFrame => {
+      const pRect = pFrame.getBoundingClientRect();
+      if (pRect.width < 100 || pRect.height < 100) return;
+
+      const hasExistingCard = childIframeEntities.some(e =>
+        (e.type === 'credit_card' || e.type === 'cvv') &&
+        e.bbox && e.bbox.x >= pRect.left - 20 && e.bbox.x <= pRect.right + 20
+      );
+      if (!hasExistingCard) {
+        const isRzp = /razorpay/i.test(pFrame.className + ' ' + (pFrame.src || '') + ' ' + (pFrame.name || ''));
+        if (isRzp) {
+          // Razorpay's iframe is full-viewport. The actual checkout dialog is centered on screen:
+          const vw = window.innerWidth;
+          const vh = window.innerHeight;
+          const isFullIframe = pRect.width >= vw * 0.85 && pRect.height >= vh * 0.85;
+          const isDesktop = vw >= 768;
+
+          // Razorpay standard modal dialog sizing (1000px x 486px on desktop, or responsive max on smaller screens)
+          const modalW = isDesktop ? Math.min(1000, Math.round(vw * 0.90)) : Math.min(480, Math.round(vw * 0.94));
+          const modalH = isDesktop ? Math.min(486, Math.round(vh * 0.88)) : Math.min(560, Math.round(vh * 0.92));
+          const modalVpLeft = isFullIframe ? Math.round((vw - modalW) / 2) : Math.round(pRect.left + (pRect.width - modalW) / 2);
+          const modalVpTop = isFullIframe
+            ? (isDesktop ? Math.max(20, Math.round((vh - modalH) / 2 - 50)) : Math.max(10, Math.round((vh - modalH) / 2)))
+            : Math.round(pRect.top + (pRect.height - modalH) / 2);
+
+          // Card Number input (top row of card container in Razorpay modal)
+          // Exact dimensions matching desktop Razorpay: left=modalLeft+578, top=modalTop+114, width=389, height=43
+          const cardVpX = isDesktop ? Math.round(modalVpLeft + modalW * 0.578) : Math.round(modalVpLeft + modalW * 0.05);
+          const cardW = isDesktop ? Math.round(modalW * 0.389) : Math.round(modalW * 0.90);
+          const cardVpY = isDesktop ? Math.round(modalVpTop + modalH * 0.235) : Math.round(modalVpTop + modalH * 0.30);
+          const cardH = 43;
+
+          // Expiry input (bottom-left cell of card container, flush under Card Number)
+          const expVpX = cardVpX;
+          const expW = Math.round(cardW / 2); // ~194px
+          const expVpY = cardVpY + cardH; // flush under Card Number (e.g. 307px)
+          const expH = 43;
+
+          // CVV input (bottom-right cell of card container, flush next to Expiry)
+          const cvvVpX = cardVpX + expW; // flush next to Expiry (e.g. 1023px)
+          const cvvW = cardW - expW; // ~195px
+          const cvvVpY = expVpY;
+          const cvvH = 43;
+
+          // Convert to page coordinates (for storage in entity.bbox)
+          const cardX = cardVpX + window.scrollX;
+          const cardY = cardVpY + window.scrollY;
+          const expX = expVpX + window.scrollX;
+          const expY = expVpY + window.scrollY;
+          const cvvX = cvvVpX + window.scrollX;
+          const cvvY = cvvVpY + window.scrollY;
+
+          childIframeEntities.push(
+            {
+              id: `fallback-card-${Date.now()}`,
+              type: 'credit_card',
+              confidence: 0.98,
+              source: 'dom',
+              sensitivity: 'CRITICAL',
+              redactionMethod: 'mask',
+              bbox: { x: cardX, y: cardY, width: cardW, height: cardH },
+              placeholder: '[CARD REDACTED]',
+              isFixed: true,
+              timestamp: Date.now(),
+            },
+            {
+              id: `fallback-exp-${Date.now()}`,
+              type: 'credit_card',
+              confidence: 0.95,
+              source: 'dom',
+              sensitivity: 'CRITICAL',
+              redactionMethod: 'mask',
+              bbox: { x: expX, y: expY, width: expW, height: expH },
+              placeholder: '[CARD REDACTED]',
+              isFixed: true,
+              timestamp: Date.now(),
+            },
+            {
+              id: `fallback-cvv-${Date.now()}`,
+              type: 'cvv',
+              confidence: 0.98,
+              source: 'dom',
+              sensitivity: 'CRITICAL',
+              redactionMethod: 'mask',
+              bbox: { x: cvvX, y: cvvY, width: cvvW, height: cvvH },
+              placeholder: '[CVV REDACTED]',
+              isFixed: true,
+              timestamp: Date.now(),
+            }
+          );
+        }
+      }
+    });
+  } catch (err) {
+    console.warn('[PrivacyAgent] Child iframe PII aggregation warning:', err);
+  }
+
   // ── Stage 5: Combine + apply policy ────────────────────────────────────────
-  // YOLOS entities merged in after existing detectors — all feed the same redaction pipeline
-  const allEntities = [...domEntities, ...domTextEntities, ...textEntities, ...ocrEntities, ...faceEntities, ...yolosEntities];
+  // YOLOS + child iframe payment entities merged in — all feed the same redaction pipeline
+  const allEntities = [
+    ...domEntities,
+    ...childIframeEntities,
+    ...domTextEntities,
+    ...textEntities,
+    ...ocrEntities,
+    ...faceEntities,
+    ...yolosEntities
+  ];
   const appliedEntities = applyPolicy(allEntities, currentSettings)
     .filter(e => !isEntityOccluded(e));
   currentEntities = appliedEntities;
@@ -898,15 +1079,17 @@ window.addEventListener('privsight:scan', async () => {
 console.log('[PrivacyAgent] Content script initialized on', location.href,
   '| Site:', getSiteStatus(location.href).compatibility);
 
-// Query background on page load so agent border shows immediately if a task is running
-try {
-  chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (resp) => {
-    if (chrome.runtime.lastError) return;
-    if (resp?.taskState && resp.taskState !== 'IDLE' && resp.taskState !== 'COMPLETED' && resp.taskState !== 'ERROR') {
-      updateAgentBorder(resp.taskState);
-    }
-  });
-} catch {}
+// Query background on page load so agent border shows immediately if a task is running (top frame only)
+if (window === window.top) {
+  try {
+    chrome.runtime.sendMessage({ type: 'GET_STATUS' }, (resp) => {
+      if (chrome.runtime.lastError) return;
+      if (resp?.taskState && resp.taskState !== 'IDLE' && resp.taskState !== 'COMPLETED' && resp.taskState !== 'ERROR') {
+        updateAgentBorder(resp.taskState);
+      }
+    });
+  } catch {}
+}
 
 // ── CHILD IFRAME AUTO-PROTECTION (RAZORPAY / STRIPE / PAYMENT GATEWAYS) ────────
 if (window !== window.top) {
@@ -918,6 +1101,33 @@ if (window !== window.top) {
       ];
       if (entities.length > 0) {
         maskLifecycleManager.createMasks(entities);
+        // Relay detected PII to parent frame for screenshot canvas redaction & unified auditing
+        const serializable = entities.map(e => ({
+          id: e.id,
+          type: e.type,
+          sensitivity: e.sensitivity,
+          confidence: e.confidence,
+          placeholder: e.placeholder,
+          rawValue: e.rawValue,
+          bbox: e.bbox ? {
+            x: Math.round(e.bbox.x - window.scrollX),
+            y: Math.round(e.bbox.y - window.scrollY),
+            width: Math.round(e.bbox.width),
+            height: Math.round(e.bbox.height),
+          } : undefined,
+        }));
+        try {
+          window.parent.postMessage({
+            type: '__PRIVSIGHT_IFRAME_PII__',
+            entities: serializable,
+          }, '*');
+        } catch {}
+        try {
+          chrome.runtime.sendMessage({
+            type: 'CHILD_FRAME_PII',
+            entities: serializable,
+          }).catch(() => {});
+        } catch {}
       }
     } catch {}
   };
@@ -931,6 +1141,12 @@ if (window !== window.top) {
   document.addEventListener('input', autoProtectIframe, true);
   document.addEventListener('change', autoProtectIframe, true);
   document.addEventListener('focusin', autoProtectIframe, true);
+
+  window.addEventListener('message', (ev) => {
+    if (ev.data?.type === '__PRIVSIGHT_REQUEST_IFRAME_PII__') {
+      autoProtectIframe();
+    }
+  });
 
   try {
     const frameObserver = new MutationObserver(() => {

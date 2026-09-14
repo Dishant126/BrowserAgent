@@ -342,5 +342,6 @@ export type ExtensionMessage =
   | { type: 'VOICE_TRANSCRIPT'; transcript: string; isFinal?: boolean }
   | { type: 'VOICE_ERROR'; errorMsg: string; errorCode?: string }
   | { type: 'SPEAK_ACTION_STATUS'; text: string; actionType?: string }
-  | { type: 'VOICE_OUTPUT_TOGGLED'; enabled: boolean };
+  | { type: 'VOICE_OUTPUT_TOGGLED'; enabled: boolean }
+  | { type: 'CHILD_FRAME_PII'; entities?: any[] };
 

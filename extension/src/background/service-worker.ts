@@ -374,6 +374,11 @@ chrome.runtime.onMessage.addListener((message: ExtensionMessage, sender, sendRes
       sendResponse({ ok: true });
       return false;
     }
+
+    case 'CHILD_FRAME_PII': {
+      sendResponse({ ok: true });
+      return false;
+    }
   }
 
   return false;
