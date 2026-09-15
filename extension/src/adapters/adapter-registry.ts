@@ -21,6 +21,7 @@ import { IlovepdfAdapter } from './ilovepdf-adapter';
 import { IrctcAdapter } from './irctc-adapter';
 import { BooksToscrapeAdapter } from './books-toscrape-adapter';
 import { QuotesToscrapeAdapter } from './quotes-toscrape-adapter';
+import { UidaiAdapter } from './uidai-adapter';
 
 // ── SUPPORTED SITES REGISTRY ─────────────────────────────────────────────────
 
@@ -32,6 +33,7 @@ const SUPPORTED_ADAPTERS: SiteAdapter[] = [
   new IrctcAdapter(),
   new BooksToscrapeAdapter(),
   new QuotesToscrapeAdapter(),
+  new UidaiAdapter(),
 ];
 
 // Demo / benchmark site treated as fully supported

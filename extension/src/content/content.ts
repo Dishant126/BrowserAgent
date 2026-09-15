@@ -19,9 +19,9 @@ import { processScreenshot } from '../vision/screenshot-redactor';
 import { detectFaces, isElementFixedOrSticky } from '../vision/face-detector';
 import { runYOLOSDetection, VisionInferenceStats } from '../vision/yolos-detector';
 import { validateAction, executeAction } from '../actions/action-validator';
-import { applyPolicy, DEFAULT_SETTINGS } from '../privacy/policy-engine';
-import { buildRegistry, checkAndResetIfNeeded } from './element-registry';
+import { buildRegistry, checkAndResetIfNeeded, resolveElementId } from './element-registry';
 import { extractA11yTree, formatA11yForLLM } from './accessibility';
+import { DEFAULT_SETTINGS, applyPolicy } from '../privacy/policy-engine';
 import { getAdapter, getSiteStatus } from '../adapters/adapter-registry';
 import { injectFloatingPanel, toggleFloatingPanel, removeFloatingPanel, isFloatingPanelVisible, updatePanelStats } from './floating-panel';
 import { updateAgentBorder, removeAgentBorder } from './agent-border';
@@ -225,11 +225,14 @@ function extractUIElements(registryRecords: ElementRecord[]): UIElement[] {
   const elements: UIElement[] = [];
 
   for (const record of registryRecords) {
-    const input = document.querySelector(record.domSelector) as HTMLInputElement | null;
-    if (!input) continue;
+    const el = (resolveElementId(record.elementId) || (record.domSelector ? document.querySelector(record.domSelector) : null)) as HTMLElement | null;
+    if (!el) continue;
 
-    const rect = input.getBoundingClientRect();
-    if (rect.width === 0 && rect.height === 0) continue;
+    const rect = el.getBoundingClientRect();
+    // Only skip if both element and record bbox have zero size (preserve custom radios/checkboxes with label bbox)
+    if (rect.width === 0 && rect.height === 0 && (!record.bbox || (record.bbox.width === 0 && record.bbox.height === 0))) {
+      continue;
+    }
 
     const isSensitive = record.sensitive;
     const bbox: BoundingBox = record.bbox;
@@ -243,10 +246,10 @@ function extractUIElements(registryRecords: ElementRecord[]): UIElement[] {
 
     // Enrich role with container context (e.g. flight card, product card)
     let extraContext = '';
-    const parentContainer = input.closest('.flight-card, tr, li, article, section, [data-flight-id], .product_pod, .quote');
+    const parentContainer = el.closest('.flight-card, tr, li, article, section, [data-flight-id], .product_pod, .quote');
     if (parentContainer) {
       const containerText = parentContainer.textContent?.replace(/\s+/g, ' ').trim() || '';
-      if (containerText && containerText !== input.textContent?.trim()) {
+      if (containerText && containerText !== el.textContent?.trim()) {
         const priceMatch = containerText.match(/(?:₹|\$|EUR|USD|INR)\s*[\d,]+/i);
         const priceStr = priceMatch ? ` price:${priceMatch[0]}` : '';
         extraContext = ` (${containerText.slice(0, 200)}${priceStr})`;
@@ -254,6 +257,7 @@ function extractUIElements(registryRecords: ElementRecord[]): UIElement[] {
     }
 
     const role = `${record.role}${extraContext}`;
+    const inputVal = (el as HTMLInputElement).value;
 
     elements.push({
       id: record.elementId,          // el_NNN (stable, sent to LLM)
@@ -262,15 +266,15 @@ function extractUIElements(registryRecords: ElementRecord[]): UIElement[] {
       role,
       label: record.ariaLabel || (record.text ? record.text : undefined),
       placeholder: record.placeholder || undefined,
-      value: isSensitive ? undefined : (input.value?.slice(0, 100) || undefined),
+      value: isSensitive ? undefined : (typeof inputVal === 'string' ? inputVal.slice(0, 100) : undefined),
       sensitive: isSensitive,
       sensitivityType: undefined,
       bbox,
       domSelector: record.domSelector,  // kept local, not sent to LLM
-      interactable: !input.disabled && !(input as any).readOnly,
+      interactable: !(el as any).disabled && !(el as any).readOnly,
       visible: record.visible,
       tagName: record.tag,
-      attributes: collectSafeAttributes(input),
+      attributes: collectSafeAttributes(el),
       ariaLabel: record.ariaLabel,
       ariaRole: record.ariaRole,
       accessibleName: record.role,
@@ -302,7 +306,7 @@ function toCleanSerializableEntities(entities: PIIEntity[]): any[] {
     sensitivity: e.sensitivity || 'HIGH',
     redactionMethod: e.redactionMethod === 'blur' ? 'Gaussian Blur' : e.redactionMethod === 'mask' ? 'Blackout Mask' : 'Semantic Token',
     placeholder: e.placeholder || (e.type === 'face' ? '[FACE BLURRED]' : `[${e.type.toUpperCase()} REDACTED]`),
-    detectedText: e.rawValue || (e.type === 'face' ? 'Profile Face Avatar' : e.type),
+    detectedText: e.placeholder || (e.type === 'face' ? 'Profile Face Avatar' : `[${e.type.toUpperCase()} REDACTED]`),
     bbox: e.bbox ? { x: Math.round(e.bbox.x), y: Math.round(e.bbox.y), width: Math.round(e.bbox.width), height: Math.round(e.bbox.height) } : undefined,
     domSelector: e.domSelector,
     timestamp: e.timestamp || Date.now(),
@@ -724,7 +728,7 @@ async function analyzePage(
     pageTitle: title,
     pageType,
     timestamp: Date.now(),
-    rawElements: (rawElements || []).slice(0, 50),
+    rawElements: (rawElements || []).slice(0, 50).map(e => (e.sensitive ? { ...e, value: undefined } : e)),
     elements: sanitizedElems,
     sanitizedText,
     ocrTexts,

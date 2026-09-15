@@ -390,7 +390,19 @@ if (typeof chrome !== 'undefined' && chrome.downloads?.onCreated) {
   chrome.downloads.onCreated.addListener((item) => {
     if (currentTask.stepNumber > 0 && !currentTask.stopped && currentTask.taskState !== 'IDLE' && currentTask.taskState !== 'COMPLETED') {
       console.log('[Background] File download detected:', item.filename || item.url);
-      const doneMsg = 'Task completed! The converted document has been saved to your downloads folder.';
+      const isAadhaarTask = /aadhaar/i.test(currentTask.instruction);
+      const isAadhaarFile = /eaadhaar|aadhaar/i.test(item.filename || item.url || '');
+      const isPdf = /\.pdf($|\?)/i.test(item.filename || item.url || '') || item.mime === 'application/pdf';
+
+      // For Aadhaar task, only complete if it is genuinely an e-Aadhaar/PDF document after user OTP/download step
+      if (isAadhaarTask && !isAadhaarFile && !isPdf) {
+        console.log('[Background] Ignoring non-Aadhaar download:', item.filename);
+        return;
+      }
+
+      const doneMsg = (isAadhaarTask || isAadhaarFile)
+        ? 'Task completed! Your e-Aadhaar PDF has been downloaded successfully and preserved in your local downloads folder.'
+        : 'Task completed! The converted document has been saved to your downloads folder.';
       currentTask.conversationHistory.push({ role: 'assistant', text: doneMsg });
       emitTraceEvent('TASK_COMPLETED', doneMsg, currentTask.stepNumber, { filename: item.filename });
       broadcastChatMessage({
@@ -465,11 +477,13 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
     const explicitUrlMatch = instruction.match(/https?:\/\/[^\s]+/i);
     if (explicitUrlMatch) {
       destinationUrl = explicitUrlMatch[0];
+    } else if (/\b(?:aadhaar|uidai|myaadhaar)\b/i.test(promptLower)) {
+      destinationUrl = 'https://myaadhaarbeta.uidai.gov.in/genericDownloadAadhaar/en';
     } else if (/irctc|train|railway|\bpnr\b/i.test(promptLower)) {
       destinationUrl = 'https://www.irctc.co.in/nget/train-search';
     } else if (/github\.com|\bgithub\b|\brepo\b|\brepository\b/i.test(promptLower)) {
       destinationUrl = 'https://github.com';
-    } else if (/\b(?:pdf|word|ilovepdf|merge|split|compress|convert)\b/i.test(promptLower)) {
+    } else if (!/\b(?:aadhaar|uidai)\b/i.test(promptLower) && (/\b(?:ilovepdf|merge\s*pdf|split\s*pdf|compress\s*pdf|pdf\s*to\s*word|word\s*to\s*pdf|convert\s*pdf)\b/i.test(promptLower) || (/\b(?:pdf\s*tools?)\b/i.test(promptLower)))) {
       if (/pdf\s+to\s+word|word\s+to\s+pdf|convert\s+pdf/i.test(promptLower)) {
         destinationUrl = 'https://www.ilovepdf.com/pdf_to_word';
       } else if (/merge/i.test(promptLower)) {
@@ -757,7 +771,7 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
           sensitivity: e.sensitivity || 'HIGH',
           redactionMethod: e.redactionMethod || (e.type === 'face' ? 'blur' : 'mask'),
           placeholder: e.placeholder || (e.type === 'face' ? '[FACE BLURRED]' : `[${e.type.toUpperCase()} REDACTED]`),
-          detectedText: e.detectedText || e.rawValue || (e.type === 'face' ? 'Profile Face Avatar' : e.type),
+          detectedText: e.placeholder || (e.type === 'face' ? 'Profile Face Avatar' : `[${e.type.toUpperCase()} REDACTED]`),
           timestamp: e.timestamp || Date.now(),
         }));
 
@@ -770,27 +784,28 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
             task: instruction,
             url: context.pageUrl,
             title: context.pageTitle,
-            rawScreenshot: screenshot,
-            sanitizedScreenshot: context.sanitizedScreenshot || screenshotToShow || screenshot,
+            sanitizedScreenshot: context.sanitizedScreenshot || screenshotToShow,
             rawElements: ((context as any).rawElements || context.elements || []).map((e: any) => ({
               id: e.id || e.elementId,
               tag: e.tagName || e.type,
               role: e.role,
               label: e.label || e.ariaLabel || e.placeholder,
               sensitive: Boolean(e.sensitive),
-              value: e.value,
+              value: e.sensitive ? `[${(e.sensitivityType || 'PII').toUpperCase()} REDACTED]` : e.value,
             })),
             elements: (context.elements || []).map((e: any) => {
               const rawL = e.label || e.ariaLabel || e.placeholder || '';
               const isEmail = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/i.test(rawL);
               const isPhone = /\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/i.test(rawL);
+              const isAadhaar = /\b[2-9]\d{3}[\s-]?[0-9]{4}[\s-]?[0-9]{4}\b/i.test(rawL);
               const isRedactedToken = /\[.*REDACTED.*\]/i.test(rawL) || /\[.*BLURRED.*\]/i.test(rawL);
-              const isSens = Boolean(e.sensitive) || isEmail || isPhone || isRedactedToken;
+              const isSens = Boolean(e.sensitive) || isEmail || isPhone || isAadhaar || isRedactedToken;
               const cleanL = rawL
                 .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/gi, '[EMAIL REDACTED]')
                 .replace(/\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, '[PHONE REDACTED]')
+                .replace(/\b[2-9]\d{3}[\s-]?[0-9]{4}[\s-]?[0-9]{4}\b/g, '[AADHAAR REDACTED]')
                 .replace(/mailto:[^\s"'>]+/gi, 'mailto:[EMAIL REDACTED]');
-              const typeStr = isEmail ? 'EMAIL' : (e.sensitivityType ? e.sensitivityType.toUpperCase() : 'PII');
+              const typeStr = isEmail ? 'EMAIL' : isAadhaar ? 'AADHAAR' : (e.sensitivityType ? e.sensitivityType.toUpperCase() : 'PII');
               return {
                 id: e.id || e.elementId,
                 tag: e.tagName || e.type,
@@ -807,21 +822,18 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
           }),
         }).catch(() => {});
 
+        const cleanContextForServer = {
+          ...context,
+          rawScreenshot: undefined,
+          rawElements: undefined,
+        };
+
         serverRes = await fetch(`${SERVER_URL}/action`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             task: instruction,
-            context,
-            rawScreenshot: screenshot,
-            rawElements: ((context as any).rawElements || context.elements || []).map((e: any) => ({
-              id: e.id || e.elementId,
-              tag: e.tagName || e.type,
-              role: e.role,
-              label: e.label || e.ariaLabel || e.placeholder,
-              sensitive: Boolean(e.sensitive),
-              value: e.value,
-            })),
+            context: cleanContextForServer,
             previousActions: currentTask.previousActions.map((a, i) => ({ ...a, step: i + 1 })),
             conversationHistory: currentTask.conversationHistory,
             stepNumber: instructionStep,
@@ -937,7 +949,13 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
           broadcastToAll({ type: 'SPEAK_ACTION_STATUS', text: spokenAsk, actionType: 'ask_user' });
         }
         const userVal = await requestUserInput(promptText, `ask-${stepNum}`);
-        const userSummary = userVal && userVal.trim() ? userVal.trim() : 'I have entered the required details on the page.';
+        let userSummary = userVal && userVal.trim() ? userVal.trim() : 'I have entered the required details on the page.';
+        // Privacy Invariant: Redact any sensitive credentials/OTPs entered in chat prompt before memory/server dispatch
+        userSummary = userSummary
+          .replace(/\b[2-9]\d{3}[\s-]?[0-9]{4}[\s-]?[0-9]{4}\b/g, '[AADHAAR ENTERED LOCALLY]')
+          .replace(/\b\d{4,8}\b/g, (match) => (/otp|code|pin/i.test(promptText) ? '[OTP ENTERED LOCALLY]' : match))
+          .replace(/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/gi, '[EMAIL REDACTED]')
+          .replace(/\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, '[PHONE REDACTED]');
         currentTask.conversationHistory.push({ role: 'assistant', text: promptText });
         currentTask.conversationHistory.push({ role: 'user', text: userSummary });
         broadcastChatMessage({
@@ -1009,10 +1027,11 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       }
 
       let execResult: any;
-      if (action.action === 'navigate' && action.url) {
-        broadcastChatMessage({ kind: 'status', text: `🌐 Navigating to ${action.url}...` });
+      const navUrl = action.url || (typeof action.value === 'string' && action.value.startsWith('http') ? action.value : undefined) || (action.target?.value && typeof action.target.value === 'string' && action.target.value.startsWith('http') ? action.target.value : undefined);
+      if (action.action === 'navigate' && navUrl) {
+        broadcastChatMessage({ kind: 'status', text: `🌐 Navigating to ${navUrl}...` });
         await sendMessageToTab(activeTabId, { type: 'CLEAR_OVERLAYS', stepId: stepNum, reason: 'pre_navigate' }).catch(() => {});
-        await chrome.tabs.update(activeTabId, { url: action.url });
+        await chrome.tabs.update(activeTabId, { url: navUrl });
         await waitForTabToSettle(activeTabId, 8000);
         execResult = { success: true };
       } else {
@@ -1067,12 +1086,19 @@ async function startTask(instruction: string, sessionId: string, targetUrl?: str
       const currentTabObj = await chrome.tabs.get(activeTabId).catch(() => null);
       const currentUrl = (currentTabObj?.url || '').toLowerCase();
 
+      const isConversionTask = /convert|ilovepdf|smallpdf|pdf2go/i.test(currentTask.instruction) || /ilovepdf\.com/i.test(currentUrl);
+      const isUidaiPortal = /uidai\.gov\.in/i.test(currentUrl) || /aadhaar/i.test(currentTask.instruction);
+
+      // Only trigger synthetic download completion for document conversion services (e.g. iLovePDF),
+      // NEVER for government/identity portals like UIDAI or general web navigation.
       const isDownloadAction =
-        Boolean(execResult?.isDownloadTrigger) ||
-        /download/i.test(reasonVal) ||
-        /download/i.test(targetLabel) ||
-        /download/i.test(targetVal) ||
-        currentUrl.includes('/download');
+        !isUidaiPortal &&
+        isConversionTask &&
+        (
+          Boolean(execResult?.isDownloadTrigger) ||
+          (/download/i.test(targetLabel) && /word|pdf|file|document/i.test(targetLabel)) ||
+          (currentUrl.includes('/download') && /download/i.test(targetLabel))
+        );
 
       if (isDownloadAction) {
         const completeMsg = 'Task completed! The converted document has been downloaded to your downloads folder.';

@@ -56,7 +56,7 @@ export const PLACEHOLDER_MAP: Record<PIIType, string> = {
   credit_card:    '[CARD REDACTED]',
   cvv:            '[CVV REDACTED]',
   password:       '[PASSWORD REMOVED]',
-  aadhaar:        '[GOVT-ID REDACTED]',
+  aadhaar:        '[AADHAAR REDACTED]',
   pan:            '[GOVT-ID REDACTED]',
   dob:            '[DOB REDACTED]',
   upi:            '[PAYMENT-ID REDACTED]',
@@ -89,8 +89,10 @@ const PATTERNS: Array<{ type: PIIType; pattern: RegExp; confidence: number }> = 
   { type: 'credit_card', pattern: /\b(?:\d[ \-]?){12,18}\d\b/g,                                                   confidence: 0.92 },
   // Card Expiry Date (MM / YY or MM/YY e.g. 12 / 29)
   { type: 'credit_card', pattern: /\b(?:0[1-9]|1[0-2])\s*\/\s*(?:2\d|3\d)\b/g,                                  confidence: 0.88 },
-  // Aadhaar (12 digits, starting with 2-9, separated by spaces or dashes)
-  { type: 'aadhaar',     pattern: /\b[2-9]\d{3}[\s-]\d{4}[\s-]\d{4}\b/g,                                          confidence: 0.92 },
+  // Aadhaar (12 digits, starting with 2-9, with or without spaces/dashes: XXXX XXXX XXXX or XXXXXXXXXXXX)
+  { type: 'aadhaar',     pattern: /\b[2-9]\d{3}[\s-]?[0-9]{4}[\s-]?[0-9]{4}\b/g,                                 confidence: 0.95 },
+  // Virtual ID (VID: 16 digits)
+  { type: 'aadhaar',     pattern: /\b[2-9]\d{3}[\s-]?[0-9]{4}[\s-]?[0-9]{4}[\s-]?[0-9]{4}\b/g,                   confidence: 0.90 },
   // PAN Card
   { type: 'pan',         pattern: /\b[A-Z]{5}[0-9]{4}[A-Z]\b/g,                                                   confidence: 0.97 },
   // UPI ID (handles without TLD, e.g. user@oksbi, user@paytm)
@@ -142,7 +144,7 @@ const SENSITIVE_PLACEHOLDER_PATTERNS: Array<{ pattern: RegExp; type: PIIType }> 
   { pattern: /cvv|cvc|csc|security.?code|verification/i,     type: 'cvv' },
   { pattern: /exp|expiry|expiration|valid.?thru|mm\s*\/?\s*yy/i, type: 'credit_card' },
   { pattern: /otp|one[-_]?time|passcode/i,                   type: 'password' },
-  { pattern: /aadhaar|aadhar/i,                              type: 'aadhaar' },
+  { pattern: /aadhaar|aadhar|\buid\b|x{4}\s*x{4}\s*x{4}|enrolment.?id|\bvid\b|\beid\b/i, type: 'aadhaar' },
   { pattern: /\bpan\b/i,                                     type: 'pan' },
   { pattern: /address/i,                                     type: 'address' },
   { pattern: /upi/i,                                         type: 'upi' },
@@ -244,11 +246,20 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
       } else if (/^\d{4,8}$/.test(cleanDigits) && /otp|passcode|verification/i.test(combinedDescriptor) && enabledTypes.has('password')) {
         detectedType = 'password';
         confidence = 0.95;
+      } else if (cleanDigits.length === 12 && /^[2-9]\d{11}$/.test(cleanDigits) && enabledTypes.has('aadhaar')) {
+        detectedType = 'aadhaar';
+        confidence = validateVerhoeff(cleanDigits) ? 0.99 : 0.94;
+      } else if (cleanDigits.length === 16 && (/vid|virtual/i.test(combinedDescriptor) || /^[2-9]\d{15}$/.test(cleanDigits)) && enabledTypes.has('aadhaar')) {
+        detectedType = 'aadhaar';
+        confidence = 0.92;
+      } else if ((cleanDigits.length === 14 || cleanDigits.length === 28) && /eid|enrol/i.test(combinedDescriptor) && enabledTypes.has('aadhaar')) {
+        detectedType = 'aadhaar';
+        confidence = 0.92;
       }
     }
 
-    if (detectedType === 'credit_card' || detectedType === 'cvv') {
-      confidence = Math.max(confidence, 0.98);
+    if (detectedType === 'credit_card' || detectedType === 'cvv' || detectedType === 'aadhaar') {
+      confidence = Math.max(confidence, 0.95);
     }
 
     if (detectedType && enabledTypes.has(detectedType)) {
@@ -356,6 +367,9 @@ export function detectPIIFromDOM(settings: PrivacySettings): PIIEntity[] {
             else if (PHONE_REGEX.test(fVal) && enabledTypes.has('phone')) fDetected = 'phone';
             else if ((/^\d{3,4}$|^\.{3,4}$|^\*{3,4}$|^•{3,4}$/.test(fVal) || /cvv|cvc|security/i.test(fCombined)) && (/cvv|cvc|security/i.test(fCombined) || fInput.maxLength === 3 || fInput.maxLength === 4 || /^\.{3,4}$|^\*{3,4}$|^•{3,4}$/.test(fVal))) fDetected = 'cvv';
             else if (/^(?:0[1-9]|1[0-2])\s*\/\s*(?:2\d|3\d)$/.test(fVal) && enabledTypes.has('credit_card')) fDetected = 'credit_card';
+            else if (digits.length === 12 && /^[2-9]\d{11}$/.test(digits) && enabledTypes.has('aadhaar')) fDetected = 'aadhaar';
+            else if (digits.length === 16 && /vid|virtual/i.test(fCombined) && enabledTypes.has('aadhaar')) fDetected = 'aadhaar';
+            else if ((digits.length === 14 || digits.length === 28) && /eid|enrol/i.test(fCombined) && enabledTypes.has('aadhaar')) fDetected = 'aadhaar';
           }
 
           if (fDetected && enabledTypes.has(fDetected)) {
@@ -872,6 +886,40 @@ function luhnCheck(num: string): boolean {
     alternate = !alternate;
   }
   return sum % 10 === 0;
+}
+
+const VERHOEFF_D: number[][] = [
+  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  [1, 2, 3, 4, 0, 6, 7, 8, 9, 5],
+  [2, 3, 4, 0, 1, 7, 8, 9, 5, 6],
+  [3, 4, 0, 1, 2, 8, 9, 5, 6, 7],
+  [4, 0, 1, 2, 3, 9, 5, 6, 7, 8],
+  [5, 9, 8, 7, 6, 0, 4, 3, 2, 1],
+  [6, 5, 9, 8, 7, 1, 0, 4, 3, 2],
+  [7, 6, 5, 9, 8, 2, 1, 0, 4, 3],
+  [8, 7, 6, 5, 9, 3, 2, 1, 0, 4],
+  [9, 8, 7, 6, 5, 4, 3, 2, 1, 0]
+];
+const VERHOEFF_P: number[][] = [
+  [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+  [1, 5, 7, 6, 2, 8, 3, 0, 9, 4],
+  [5, 8, 0, 3, 7, 9, 6, 1, 4, 2],
+  [8, 9, 1, 6, 0, 4, 3, 5, 2, 7],
+  [9, 4, 5, 3, 1, 2, 6, 8, 7, 0],
+  [4, 2, 8, 6, 5, 7, 3, 9, 0, 1],
+  [2, 7, 9, 3, 8, 0, 6, 4, 1, 5],
+  [7, 0, 4, 6, 9, 1, 3, 2, 5, 8]
+];
+
+export function validateVerhoeff(numStr: string): boolean {
+  let c = 0;
+  const clean = numStr.replace(/\D/g, '');
+  if (clean.length !== 12) return false;
+  const reversed = clean.split('').reverse();
+  for (let i = 0; i < reversed.length; i++) {
+    c = VERHOEFF_D[c][VERHOEFF_P[i % 8][parseInt(reversed[i], 10)]];
+  }
+  return c === 0;
 }
 
 function deduplicate(entities: PIIEntity[]): PIIEntity[] {

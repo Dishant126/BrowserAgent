@@ -111,8 +111,8 @@ export function redactScreenshot(canvas: HTMLCanvasElement, entities: PIIEntity[
 
     if (entity.redactionMethod === 'blur' || entity.type === 'face') {
       blurCanvasRegion(ctx, clampedBbox, 25);
-    } else if (entity.type === 'password' || entity.type === 'credit_card' || entity.type === 'cvv') {
-      // Blur underlying pixels + orange box mask for credentials and payment details
+    } else if (entity.type === 'password' || entity.type === 'credit_card' || entity.type === 'cvv' || entity.type === 'aadhaar') {
+      // Blur underlying pixels + orange box mask for credentials, payment details, and government IDs
       blurCanvasRegion(ctx, clampedBbox, 25);
       ctx.fillStyle = 'rgba(249, 115, 22, 0.30)';
       ctx.fillRect(clampedX, clampedY, clampedW, clampedH);
@@ -155,18 +155,26 @@ export async function loadAndRedactScreenshot(
     img.crossOrigin = 'anonymous';
     img.onload = () => {
       const canvas = document.createElement('canvas');
-      canvas.width = img.naturalWidth || window.innerWidth;
-      canvas.height = img.naturalHeight || window.innerHeight;
+      canvas.width = img.width;
+      canvas.height = img.height;
       const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.drawImage(img, 0, 0);
+      if (!ctx) {
+        resolve(dataUrl);
+        return;
+      }
+      ctx.drawImage(img, 0, 0);
+      try {
         const redactedUrl = redactScreenshot(canvas, entities, scrollX, scrollY);
         resolve(redactedUrl);
-      } else {
+      } catch (err) {
+        console.warn('[PrivacyAgent] loadAndRedactScreenshot canvas error:', err);
         resolve(dataUrl);
       }
     };
-    img.onerror = () => resolve(dataUrl);
+    img.onerror = () => {
+      console.warn('[PrivacyAgent] loadAndRedactScreenshot image load failed');
+      resolve(dataUrl);
+    };
     img.src = dataUrl;
   });
 }
@@ -175,6 +183,8 @@ const PII_PATTERNS = [
   { type: 'email' as const, regex: /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/gi, token: '[EMAIL REDACTED]' },
   { type: 'phone' as const, regex: /\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/g, token: '[PHONE REDACTED]' },
   { type: 'credit_card' as const, regex: /\b(?:\d{4}[-\s]?){3}\d{4}\b/g, token: '[CARD REDACTED]' },
+  { type: 'aadhaar' as const, regex: /\b[2-9]\d{3}[\s-]?[0-9]{4}[\s-]?[0-9]{4}\b/g, token: '[AADHAAR REDACTED]' },
+  { type: 'dob' as const, regex: /\b(?:\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/g, token: '[DOB REDACTED]' },
   { type: 'auth_token' as const, regex: /\b(?:ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{50,}|eyJh[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,})\b/gi, token: '[AUTH_TOKEN REDACTED]' },
 ];
 

@@ -186,7 +186,17 @@ function computeAccessibleName(el: HTMLElement): string {
   const input = el as HTMLInputElement;
   if (el.id) {
     const lbl = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(el.id)}"]`);
-    if (lbl) return lbl.textContent?.trim() ?? '';
+    if (lbl?.textContent?.trim()) return lbl.textContent.trim();
+  }
+  const parentLabel = el.closest('label');
+  if (parentLabel?.textContent?.trim()) {
+    return parentLabel.textContent.trim();
+  }
+  if (el.nextElementSibling?.textContent?.trim()) {
+    return el.nextElementSibling.textContent.trim();
+  }
+  if (input.value && input.value !== 'on' && input.value !== 'true' && input.value.length < 40) {
+    return input.value;
   }
 
   // 4. Text content (for buttons, links)

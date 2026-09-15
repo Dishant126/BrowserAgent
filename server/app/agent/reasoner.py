@@ -121,6 +121,11 @@ GENERAL-PURPOSE AGENT STRATEGIES (Works on ANY website):
 - SCROLLING & UNFOUND ELEMENTS:
   * If a requested item or button is not visible in the current viewport elements and you have not scrolled yet, emit a 'scroll' action downwards to bring it into view.
   * If you have already scrolled and the requested item clearly does not exist on the page, return 'ask_user' or 'done' explaining that the element was not found.
+- UIDAI / MYAADHAAR WORKFLOW:
+  * On the MyAadhaar home page: locate and click 'Download Aadhaar' / 'Download Aadhaar Service'.
+  * On the Download Aadhaar page: entering an Aadhaar number and solving the visual CAPTCHA is required. NEVER guess or bypass CAPTCHA. Emit 'ask_user' with prompt: "Please enter your 12-digit Aadhaar number and solve the CAPTCHA security code on the page, then click Request OTP."
+  * When the OTP input field appears: emit 'ask_user' with prompt: "An OTP has been sent to your UIDAI-registered mobile. Please enter the OTP to continue."
+  * Once the user confirms OTP entry: click 'Verify & Download e-Aadhaar'. The downloaded e-Aadhaar PDF is preserved safely on the local device.
 
 ELEMENT ID FORMAT:
 Each interactive element has a stable ID like el_001. The target field must use:
@@ -241,6 +246,8 @@ PAGE TEXT (sanitized):
 
 INSTRUCTIONS: Use the el_NNN IDs from INTERACTABLE ELEMENTS in your target. 
 Look at ACTIONS ALREADY EXECUTED and CONVERSATION HISTORY. Do NOT repeat any action already done.
+CRITICAL: When completing OTP or submitting a form, NEVER click close (✕) or dismiss buttons! Always click the submission/verification button (e.g. 'Verify & Download').
+Do NOT click modal close (✕) or dismiss buttons unless the user explicitly requested to close or cancel.
 Return the SINGLE best NEXT action as JSON only."""
 
 
@@ -326,6 +333,28 @@ def parse_action_response(text: Any, context: Optional[SanitizedContext] = None,
                     target.friendlyName = cleaned
                     target.label = cleaned
                     break
+
+    # ── Guardrail: Prevent clicking close (✕) button when completing forms or OTP ─────────
+    if action_type == "click" and target and context and getattr(context, "elements", None):
+        target_role = ""
+        for el in context.elements:
+            el_id = getattr(el, "elementId", None) or el.id or ""
+            if el_id == target.value:
+                target_role = (getattr(el, "role", "") or getattr(el, "label", "") or "").lower()
+                break
+        is_close_target = any(k in target_role for k in ["close dialog", "✕", "do not click", "dismiss"])
+        wants_close = any(k in (task or "").lower() for k in ["close", "cancel", "dismiss", "exit"])
+        if is_close_target and not wants_close:
+            # LLM mistakenly clicked close button thinking it's the action button!
+            # Redirect to the actual verify / submit button if present!
+            verify_el = next((el for el in context.elements if any(k in (getattr(el, "role", "") or getattr(el, "label", "")).lower() for k in ["verify & download", "verify and download", "verify", "submit otp", "download e-aadhaar"])), None)
+            if verify_el:
+                target.value = getattr(verify_el, "elementId", None) or verify_el.id
+                target.elementId = target.value
+                target.friendlyName = getattr(verify_el, "label", None) or getattr(verify_el, "role", None) or "Verify & Download"
+                target.label = target.friendlyName
+                friendly_name = target.friendlyName
+                reason = "Clicking 'Verify & Download' button to complete the process"
 
     reason = data.get("reason", "LLM decision")
     task_str = (task or "").lower().strip()
@@ -482,7 +511,7 @@ class DynamicDOMSolverLLM:
             cur_val     = (val_m.group(1)   if val_m   else "").lower()
 
             # Combined hint for keyword matching
-            hint = f"{label} {placeholder} {role} {aria}".strip().lower()
+            hint = f"{label} {placeholder} {role} {aria} {cur_val}".strip().lower()
 
             is_button = tag in ("button",) or "button" in role
             is_input  = tag in ("input", "textarea") and tag != "button"
@@ -602,7 +631,14 @@ class DynamicDOMSolverLLM:
         # ── SPECIAL HANDLING 0: Direct navigation if starting on search engine / new tab ──────────
         is_search_or_blank = any(w in page_url.lower() for w in ["google.com", "bing.com", "duckduckgo.com", "search.brave.com", "newtab", "about:blank", "brave://", "chrome://"]) or not page_url
         if is_search_or_blank:
-            if re.search(r'\b(?:pdf\s+to\s+word|convert\s+pdf|word\s+to\s+pdf)\b', task_lower):
+            if re.search(r'\b(?:aadhaar|uidai|myaadhaar)\b', task_lower):
+                return json.dumps({
+                    "action": "navigate",
+                    "url": "https://myaadhaar.uidai.gov.in",
+                    "reason": "Navigating directly to official UIDAI MyAadhaar portal",
+                    "confidence": 0.98,
+                })
+            elif re.search(r'\b(?:pdf\s+to\s+word|convert\s+pdf|word\s+to\s+pdf)\b', task_lower) and not re.search(r'\b(?:aadhaar|uidai)\b', task_lower):
                 return json.dumps({
                     "action": "navigate",
                     "url": "https://www.ilovepdf.com/pdf_to_word",
@@ -671,20 +707,20 @@ class DynamicDOMSolverLLM:
 
         # ── SPECIAL HANDLING 2b: Payment Gateway / Card Details (Human-In-The-Loop) ──────────
         has_card_or_cvv_in_lines = any(
-            any(w in line.lower() for w in ["credit_card", "cvv", "card", "expiry"])
+            any(w in line.lower() for w in ["credit_card", "cvv", "card number", "expiry date", "credit card", "debit card"])
             for line in elem_lines
         )
         is_payment_flow = (
             "razorpay" in page_url.lower() or
             "checkout" in page_url.lower() or
             "payment" in page_url.lower() or
-            any(k in task_lower for k in ["pay", "card", "checkout", "continue", "buy"]) or
+            any(k in task_lower for k in ["pay", "payment", "checkout", "buy"]) or
             has_card_or_cvv_in_lines
-        )
+        ) and not ("uidai" in page_url.lower() or "aadhaar" in task_lower)
         has_card_or_cvv_inputs = any(
-            el["is_input"] and any(k in el["hint"] for k in ["card", "cvv", "expiry", "mm / yy", "security", "number"])
+            el["is_input"] and any(k in el["hint"] for k in ["card number", "cvv", "cvc", "expiry", "mm / yy", "security code"])
             for el in parsed
-        ) or has_card_or_cvv_in_lines
+        )
 
         if is_payment_flow and has_card_or_cvv_inputs:
             last_user_msg = next((m.get("text", "") for m in reversed(conv_history or []) if m.get("role") == "user"), "")
@@ -696,6 +732,112 @@ class DynamicDOMSolverLLM:
                     "prompt": "Please enter your card number, expiry date, and CVV to proceed with payment. All your financial details remain completely masked and private on your local device.",
                     "reason": "Payment security: Card details and CVV must be entered by the user with Human-in-the-Loop",
                     "confidence": 0.98,
+                })
+
+        # ── SPECIAL HANDLING 2c: UIDAI Aadhaar Download (Human-In-The-Loop) ──────────
+        is_uidai = "uidai" in page_url.lower() or "aadhaar" in task_lower
+        if is_uidai:
+            last_user_msg = next((m.get("text", "") for m in reversed(conv_history or []) if m.get("role") == "user"), "").lower()
+            user_confirmed = any(k in last_user_msg for k in ["done", "entered", "filled", "typed", "submitted", "i have entered", "details received", "provided", "ok", "yes", "proceed"])
+
+            # Check if on Download Aadhaar page
+            is_download_page = "genericdownloadaadhaar" in page_url.lower() or "gen-ae-aadhaar" in page_url.lower() or any("aadhaar number" in el["hint"] or "type characters" in el["hint"] for el in parsed)
+
+            if is_download_page:
+                # Check for "Verify & Download" button (EXCLUDE close/dismiss buttons and service cards!)
+                verify_btn = next((el for el in parsed if any(k in el["hint"] for k in ["verify & download", "verify and download", "verify &amp; download", "download e-aadhaar", "download aadhaar"]) and not any(k in el["hint"] for k in ["service", "card", "home", "faq", "close", "dismiss", "✕", "\u2715", "x"])), None)
+                if not verify_btn:
+                    verify_btn = next((el for el in parsed if any(k in el["hint"] for k in ["verify", "download"]) and not any(k in el["hint"] for k in ["service", "card", "home", "faq", "close", "dismiss", "✕", "\u2715", "captcha"])), None)
+
+                # Check if OTP fields or OTP modal/drawer is open
+                has_otp_field = any(
+                    (("enter mobile otp" in el["hint"] or "otp" in el["hint"]) and el["is_input"]) or
+                    (el["is_input"] and el.get("cur_val") and len(el.get("cur_val", "")) == 1)
+                    for el in parsed
+                ) or (verify_btn is not None)
+
+                # ── STEP A: If OTP modal / Verify & Download button is present ──
+                if verify_btn is not None or has_otp_field:
+                    assistant_asked_otp = any(any(k in m.get("text", "").lower() for k in ["enter the otp", "enter otp", "otp has been sent", "mobile otp", "enter your otp"]) for m in (conv_history or []) if m.get("role") == "assistant")
+                    has_digits_entered = any(el["is_input"] and el.get("cur_val") and len(el.get("cur_val", "")) > 0 for el in parsed)
+                    user_confirmed_otp = (assistant_asked_otp and user_confirmed) or ("otp" in last_user_msg and user_confirmed)
+                    otp_ready = user_confirmed_otp or has_digits_entered
+
+                    if not otp_ready:
+                        return json.dumps({
+                            "action": "ask_user",
+                            "prompt": "An OTP has been sent to your UIDAI-registered mobile. Please enter the OTP on the page to continue.",
+                            "reason": "UIDAI OTP verification requires Human-in-the-Loop; sensitive OTP is protected on-device",
+                            "confidence": 0.98,
+                        })
+                    elif verify_btn:
+                        return json.dumps({
+                            "action": "click",
+                            "target": {"type": "element-id", "value": verify_btn["el_id"], "elementId": verify_btn["el_id"]},
+                            "reason": "Clicking 'Verify & Download' button to download e-Aadhaar",
+                            "confidence": 0.98,
+                        })
+
+                # ── STEP B: Select Regular / Masked Radio Option if requested ──
+                wants_masked = any(k in task_lower for k in ["masked", "mask aadhaar", "masked aadhaar"]) or any("masked" in m.get("text", "").lower() for m in reversed(conv_history or []) if m.get("role") == "user")
+                wants_regular = any(k in task_lower for k in ["regular", "unmasked", "normal aadhaar"]) or any("regular" in m.get("text", "").lower() for m in reversed(conv_history or []) if m.get("role") == "user")
+
+                if wants_masked:
+                    masked_btn = next((el for el in parsed if any(k in el["hint"] for k in ["masked", "masked aadhaar", "do you want a masked aadhaar"]) and not any(k in el["hint"] for k in ["what is masked", "faq", "regular"])), None)
+                    if masked_btn and ("click", masked_btn["el_id"]) not in done_set and "(checked)" not in masked_btn.get("role", ""):
+                        return json.dumps({
+                            "action": "click",
+                            "target": {"type": "element-id", "value": masked_btn["el_id"], "elementId": masked_btn["el_id"]},
+                            "reason": "Selecting 'Masked Aadhaar' option per user instruction",
+                            "confidence": 0.98,
+                        })
+                elif wants_regular:
+                    regular_btn = next((el for el in parsed if any(k in el["hint"] for k in ["regular aadhaar", "regular"]) and not any(k in el["hint"] for k in ["faq", "service"])), None)
+                    if regular_btn and ("click", regular_btn["el_id"]) not in done_set and "(checked)" not in regular_btn.get("role", ""):
+                        return json.dumps({
+                            "action": "click",
+                            "target": {"type": "element-id", "value": regular_btn["el_id"], "elementId": regular_btn["el_id"]},
+                            "reason": "Selecting 'Regular Aadhaar' option per user instruction",
+                            "confidence": 0.98,
+                        })
+
+                # ── STEP C: Check if credentials/CAPTCHA input needed ──
+                has_cred_inputs = any(el["is_input"] and ("aadhaar" in el["hint"] or "captcha" in el["hint"] or "type characters" in el["hint"]) for el in parsed)
+                if has_cred_inputs and not user_confirmed:
+                    return json.dumps({
+                        "action": "ask_user",
+                        "prompt": "Please enter your 12-digit Aadhaar number and solve the CAPTCHA security code on the page, then click Send OTP.",
+                        "reason": "UIDAI security requires user to solve CAPTCHA and provide Aadhaar number; sensitive credentials are masked on-device",
+                        "confidence": 0.98,
+                    })
+
+                # ── STEP D: If user already entered credentials, click Request OTP / Get OTP (ONLY if verify_btn does NOT exist) ──
+                if verify_btn is None:
+                    req_otp_btn = next((el for el in parsed if any(k in el["hint"] for k in ["send otp", "request otp", "get otp"])), None)
+                    if req_otp_btn and ("click", req_otp_btn["el_id"]) not in done_set:
+                        return json.dumps({
+                            "action": "click",
+                            "target": {"type": "element-id", "value": req_otp_btn["el_id"], "elementId": req_otp_btn["el_id"]},
+                            "reason": "Clicking 'Send OTP' button after user solved CAPTCHA",
+                            "confidence": 0.95,
+                        })
+
+            # On MyAadhaar home page: locate Download Aadhaar service card or Get Aadhaar
+            dl_card = next((el for el in parsed if any(k in el["hint"] for k in ["download aadhaar", "get aadhaar", "electronic copy", "e-aadhaar"]) and ("click", el["el_id"]) not in done_set), None)
+            if dl_card:
+                return json.dumps({
+                    "action": "click",
+                    "target": {"type": "element-id", "value": dl_card["el_id"], "elementId": dl_card["el_id"]},
+                    "reason": "Navigating to Download Aadhaar service on UIDAI portal",
+                    "confidence": 0.95,
+                })
+
+            if not is_download_page and any((h.get("action") == "click") for h in (history or [])):
+                return json.dumps({
+                    "action": "navigate",
+                    "url": "https://myaadhaarbeta.uidai.gov.in/genericDownloadAadhaar/en",
+                    "reason": "Navigating directly to e-Aadhaar download page on UIDAI portal",
+                    "confidence": 0.95,
                 })
 
 
@@ -723,9 +865,10 @@ class DynamicDOMSolverLLM:
             elif re.search(r'\b(?:2a|2 tier|2nd ac|second ac)\b', task_lower): req_class = "2 tier"
             elif re.search(r'\b(?:1a|1st ac|first ac)\b', task_lower): req_class = "first"
 
+            # Click travel class
             if req_class:
-                class_el = next((el for el in parsed if req_class in el["hint"] and ("select class" in el["hint"] or "class tab" in el["hint"])), None)
-                if class_el and ("click", class_el["el_id"]) not in done_set:
+                class_el = next((el for el in parsed if req_class in el["hint"] and ("click", el["el_id"]) not in done_set), None)
+                if class_el:
                     return json.dumps({
                         "action": "click",
                         "target": {"type": "element-id", "value": class_el["el_id"], "elementId": class_el["el_id"]},
@@ -782,7 +925,7 @@ class DynamicDOMSolverLLM:
             })
 
         # If on download page and download button was clicked or file has finished converting, complete task
-        is_on_download_page = "/download" in page_url.lower() or "converted to an editable" in (page_title + " " + sanitized_text).lower()
+        is_on_download_page = not is_uidai and ("/download" in page_url.lower() or "converted to an editable" in (page_title + " " + sanitized_text).lower())
         if is_on_download_page and (len(history or []) > 0 or ("click", download_btn["el_id"] if download_btn else "") in done_set):
             return json.dumps({
                 "action": "done",

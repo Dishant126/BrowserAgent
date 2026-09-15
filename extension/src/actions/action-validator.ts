@@ -112,12 +112,12 @@ function resolveTarget(action: BrowserAction): Element | null {
     );
     if (el) return el;
 
-    // Priority 6: Button / link text search
+    // Priority 6: Button / link / radio / checkbox text search
     const candidates = document.querySelectorAll<Element>(
-      'button, a, input[type="submit"], input[type="button"], [role="button"]'
+      'button, a, input[type="submit"], input[type="button"], [role="button"], [role="radio"], [role="checkbox"], input[type="radio"], input[type="checkbox"], label'
     );
     for (const c of candidates) {
-      if (c.textContent?.toLowerCase().includes(rawVal.toLowerCase())) return c;
+      if (c.textContent?.toLowerCase().includes(rawVal.toLowerCase()) || (c as HTMLInputElement).value?.toLowerCase() === rawVal.toLowerCase()) return c;
     }
 
     // Priority 7: Input search by label text
@@ -131,6 +131,7 @@ function resolveTarget(action: BrowserAction): Element | null {
         }
         const childInput = lbl.querySelector('input, select, textarea');
         if (childInput) return childInput;
+        return lbl;
       }
     }
   } catch {
@@ -228,6 +229,74 @@ export async function executeAction(action: BrowserAction): Promise<ActionResult
           // Show on-page interactive user-activation toast in case browser security requires direct tab gesture
           showFileSelectionNotification(el, fileInputs);
         } else {
+          // Radio / Checkbox state synchronizer for React, Angular, Vue, and vanilla DOM
+          const isRadioOrCheckbox =
+            (el.tagName === 'INPUT' && ((el as HTMLInputElement).type === 'radio' || (el as HTMLInputElement).type === 'checkbox')) ||
+            el.getAttribute('role') === 'radio' ||
+            el.getAttribute('role') === 'checkbox';
+
+          if (isRadioOrCheckbox) {
+            const inputEl = (el.tagName === 'INPUT'
+              ? el
+              : (el.querySelector('input[type="radio"], input[type="checkbox"]') ||
+                 el.parentElement?.querySelector('input[type="radio"], input[type="checkbox"]') ||
+                 (el.getAttribute('for') ? document.getElementById(el.getAttribute('for')!) : null)
+                )
+            ) as HTMLInputElement | null;
+
+            if (inputEl) {
+              const targetChecked = inputEl.type === 'radio' ? true : !inputEl.checked;
+              const nativeCheckedSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'checked')?.set;
+              if (nativeCheckedSetter) {
+                nativeCheckedSetter.call(inputEl, targetChecked);
+              } else {
+                inputEl.checked = targetChecked;
+              }
+              try { inputEl.focus(); } catch {}
+              inputEl.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+              inputEl.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+
+              try {
+                inputEl.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+                inputEl.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                inputEl.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
+                inputEl.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                inputEl.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: window }));
+                inputEl.click();
+              } catch {}
+
+              // Also click associated label or container
+              const parentLabel = inputEl.closest('label') ||
+                                  (inputEl.id ? document.querySelector<HTMLElement>(`label[for="${CSS.escape(inputEl.id)}"]`) : null) ||
+                                  inputEl.closest('[class*="radio"], [class*="option"], .mat-radio-button, .form-check') ||
+                                  inputEl.parentElement;
+              if (parentLabel && parentLabel !== inputEl) {
+                parentLabel.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
+                parentLabel.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+                parentLabel.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, cancelable: true, view: window }));
+                parentLabel.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+                parentLabel.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, composed: true, view: window }));
+                parentLabel.click();
+              }
+            }
+          }
+
+          if (el.tagName === 'LABEL') {
+            const forId = el.getAttribute('for');
+            const targetInput = (forId ? document.getElementById(forId) : el.querySelector('input')) as HTMLInputElement | null;
+            if (targetInput && (targetInput.type === 'radio' || targetInput.type === 'checkbox')) {
+              const targetChecked = targetInput.type === 'radio' ? true : !targetInput.checked;
+              const nativeCheckedSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'checked')?.set;
+              if (nativeCheckedSetter) {
+                nativeCheckedSetter.call(targetInput, targetChecked);
+              } else {
+                targetInput.checked = targetChecked;
+              }
+              targetInput.dispatchEvent(new Event('input', { bubbles: true }));
+              targetInput.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+          }
+
           // Dispatch full event sequence for standard interactive elements (including download buttons)
           el.dispatchEvent(new MouseEvent('pointerdown', { bubbles: true, cancelable: true, view: window }));
           el.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
@@ -288,12 +357,22 @@ export async function executeAction(action: BrowserAction): Promise<ActionResult
       }
 
       case 'select': {
-        const el = resolveTarget(action) as HTMLSelectElement | null;
+        const el = resolveTarget(action) as HTMLElement | null;
         if (!el) throw new Error(`Select target not found: ${JSON.stringify(action.target)}`);
         el.scrollIntoView({ behavior: 'smooth', block: 'center' });
         highlightInteraction(el, 'fill');
-        el.value = action.value ?? '';
-        el.dispatchEvent(new Event('change', { bubbles: true }));
+        if (el.tagName === 'SELECT') {
+          (el as HTMLSelectElement).value = action.value ?? '';
+          el.dispatchEvent(new Event('change', { bubbles: true }));
+        } else if (el.tagName === 'INPUT' && ((el as HTMLInputElement).type === 'radio' || (el as HTMLInputElement).type === 'checkbox')) {
+          const input = el as HTMLInputElement;
+          const targetChecked = input.type === 'radio' ? true : !input.checked;
+          const nativeCheckedSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'checked')?.set;
+          if (nativeCheckedSetter) nativeCheckedSetter.call(input, targetChecked);
+          else input.checked = targetChecked;
+          input.dispatchEvent(new Event('input', { bubbles: true }));
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
         break;
       }
 

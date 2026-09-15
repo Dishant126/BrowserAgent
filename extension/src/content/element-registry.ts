@@ -61,6 +61,7 @@ export function buildRegistry(): ElementRecord[] {
     'select',
     'textarea',
     'a[href]',
+    'label:has(input)',
     '[role="button"]',
     '[role="link"]',
     '[role="textbox"]',
@@ -68,6 +69,10 @@ export function buildRegistry(): ElementRecord[] {
     '[role="searchbox"]',
     '[role="menuitem"]',
     '[role="tab"]',
+    '[role="radio"]',
+    '[role="checkbox"]',
+    '[role="switch"]',
+    '[role="option"]',
     '[contenteditable="true"]',
   ].join(', ');
 
@@ -75,23 +80,40 @@ export function buildRegistry(): ElementRecord[] {
   const records: ElementRecord[] = [];
 
   document.querySelectorAll<HTMLElement>(INTERACTIVE_SELECTORS).forEach(el => {
-    const rect = el.getBoundingClientRect();
-    // Skip elements that are not visible
-    if (rect.width === 0 && rect.height === 0) return;
+    let rect = el.getBoundingClientRect();
+    const isRadioOrCheckbox = el.tagName === 'INPUT' && ((el as HTMLInputElement).type === 'radio' || (el as HTMLInputElement).type === 'checkbox');
+
+    // Skip elements that are not visible (allow custom styled radio/checkboxes if parent container/label is visible)
+    if (rect.width === 0 && rect.height === 0) {
+      if (isRadioOrCheckbox) {
+        const parentContainer = el.closest('label') ||
+          (el.id ? document.querySelector<HTMLElement>(`label[for="${CSS.escape(el.id)}"]`) : null) ||
+          el.closest('[class*="radio"], [class*="option"], [class*="form-check"], div, span') ||
+          el.parentElement;
+        if (parentContainer) {
+          const lRect = parentContainer.getBoundingClientRect();
+          if (lRect.width === 0 && lRect.height === 0) return;
+          rect = lRect; // Use container's bounding box for interaction
+        } else {
+          return;
+        }
+      } else {
+        return;
+      }
+    }
     if (rect.top > window.innerHeight + 500) return; // far off-screen
 
     const isSensitive = detectSensitivity(el);
     // Never occlude sensitive financial or auth fields if they are in the viewport
     if (!isSensitive && isElementOccluded(el, rect)) return; // occluded or covered by modal/backdrop
 
-    let selector = buildStableSelector(el);
-    if (seen.has(selector)) {
-      // Ensure selector uniqueness so distinct interactive buttons/links are never discarded
-      selector = `${selector}#item-${counter + 1}`;
-    }
-    seen.add(selector);
-
     const elementId = `el_${String(++counter).padStart(3, '0')}`;
+    // Tag element with persistent local data attribute for 100% reliable CSS selection & resolution
+    try {
+      el.setAttribute('data-ag-id', elementId);
+    } catch {}
+
+    const selector = `[data-ag-id="${elementId}"]`;
     const input = el as HTMLInputElement;
     const bbox: BoundingBox = {
       x: Math.round(rect.left + window.scrollX),
@@ -138,15 +160,13 @@ export function buildRegistry(): ElementRecord[] {
  */
 export function resolveElementId(elementId: string): Element | null {
   const entry = registry.get(elementId);
-  if (!entry) return null;
-
-  // Verify the element is still in the DOM
-  if (!document.body.contains(entry.element)) {
-    registry.delete(elementId);
-    return null;
+  if (entry && document.body.contains(entry.element)) {
+    return entry.element;
   }
-
-  return entry.element;
+  // Fast attribute fallback
+  const direct = document.querySelector(`[data-ag-id="${elementId}"]`);
+  if (direct) return direct;
+  return null;
 }
 
 /**
@@ -239,8 +259,18 @@ function buildSemanticRole(el: HTMLElement, ariaLabel?: string | null, ariaRole?
 
   // Button-like elements
   if (tag === 'button' || ariaRole === 'button' || input.type === 'submit' || input.type === 'button') {
-    const txt = el.textContent?.trim() || el.getAttribute('value') || 'button';
-    return txt.slice(0, 60);
+    const txt = el.textContent?.trim() || el.getAttribute('value') || '';
+    const aria = (el.getAttribute('aria-label') || '').toLowerCase();
+    const isCloseBtn =
+      txt === '✕' || txt === '×' || txt === 'X' || txt.toLowerCase() === 'close' ||
+      aria === 'close' || aria.includes('close') || aria.includes('dismiss') ||
+      el.classList.contains('close') || el.classList.contains('btn-close') ||
+      (el.querySelector('svg, [class*="close"], [class*="times"]') !== null && txt.length <= 2);
+
+    if (isCloseBtn) {
+      return 'Close dialog button (✕) - DO NOT CLICK TO SUBMIT';
+    }
+    return (txt || 'button').slice(0, 60);
   }
 
   // Links
@@ -253,6 +283,11 @@ function buildSemanticRole(el: HTMLElement, ariaLabel?: string | null, ariaRole?
   if (tag === 'input') {
     const label = findAssociatedLabel(el);
     const ph = input.placeholder;
+    if (input.type === 'radio' || input.type === 'checkbox') {
+      const state = input.checked ? ' (checked)' : ' (unchecked)';
+      if (label) return `${label} ${input.type}${state}`;
+      return `${input.type} input${state}`;
+    }
     if (label) return label;
     if (ph) return ph.slice(0, 60);
     return `${input.type || 'text'} input`;
@@ -276,12 +311,35 @@ function buildSemanticRole(el: HTMLElement, ariaLabel?: string | null, ariaRole?
 function findAssociatedLabel(el: HTMLElement): string | null {
   if (el.id) {
     const lbl = document.querySelector<HTMLLabelElement>(`label[for="${CSS.escape(el.id)}"]`);
-    if (lbl) return lbl.textContent?.trim() ?? null;
+    if (lbl && lbl.textContent?.trim()) return lbl.textContent.trim();
   }
-  const parent = el.closest('label, .form-group, .field-group, [class*="form"]');
+  const parentLabel = el.closest('label');
+  if (parentLabel && parentLabel.textContent?.trim()) {
+    return parentLabel.textContent.trim();
+  }
+  const parent = el.closest('.form-group, .field-group, [class*="radio"], [class*="checkbox"]');
   if (parent) {
     const lbl = parent.querySelector('label');
-    if (lbl && lbl !== el) return lbl.textContent?.trim() ?? null;
+    if (lbl && lbl !== el && lbl.textContent?.trim()) return lbl.textContent.trim();
+    const span = parent.querySelector('span, p');
+    if (span && span.textContent?.trim()) return span.textContent.trim();
+  }
+  // Direct parent text for radio / checkbox items
+  if (el.tagName === 'INPUT' && ((el as HTMLInputElement).type === 'radio' || (el as HTMLInputElement).type === 'checkbox')) {
+    const parentText = el.parentElement?.textContent?.trim();
+    if (parentText && parentText.length < 50 && !parentText.includes('\n')) {
+      return parentText;
+    }
+  }
+  if (el.nextElementSibling && el.nextElementSibling.textContent?.trim()) {
+    return el.nextElementSibling.textContent.trim();
+  }
+  if (el.previousElementSibling && el.previousElementSibling.textContent?.trim()) {
+    return el.previousElementSibling.textContent.trim();
+  }
+  const val = (el as HTMLInputElement).value;
+  if (val && val !== 'on' && val !== 'true' && val.length < 40) {
+    return val;
   }
   return null;
 }
@@ -318,5 +376,19 @@ function detectSensitivity(el: HTMLElement): boolean {
 
 function isVisible(el: HTMLElement): boolean {
   const style = window.getComputedStyle(el);
-  return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  if (style.display === 'none' || style.visibility === 'hidden') return false;
+  if (parseFloat(style.opacity || '1') === 0) {
+    if (el.tagName === 'INPUT') {
+      const input = el as HTMLInputElement;
+      if (input.type === 'radio' || input.type === 'checkbox') {
+        const parentLabel = el.closest('label') || (el.id ? document.querySelector(`label[for="${CSS.escape(el.id)}"]`) : null);
+        if (parentLabel) {
+          const lStyle = window.getComputedStyle(parentLabel);
+          return lStyle.display !== 'none' && lStyle.visibility !== 'hidden' && parseFloat(lStyle.opacity || '1') > 0;
+        }
+      }
+    }
+    return false;
+  }
+  return true;
 }

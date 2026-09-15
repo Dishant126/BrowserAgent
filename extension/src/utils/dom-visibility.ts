@@ -57,7 +57,8 @@ export function getActiveModals(): Element[] {
           el.id === '__privacy-agent-overlay__' ||
           el.id === '__privsight-host__' ||
           el.id === '__privsight-floating-panel__' ||
-          el.closest('#__privacy-agent-overlay__, #__privsight-host__, #__privsight-floating-panel__')
+          el.id === '__antigravity_agent_border__' ||
+          el.closest('#__privacy-agent-overlay__, #__privsight-host__, #__privsight-floating-panel__, #__antigravity_agent_border__')
         ) {
           continue;
         }
@@ -95,7 +96,8 @@ export function getActiveModals(): Element[] {
         el.id === '__privacy-agent-overlay__' ||
         el.id === '__privsight-host__' ||
         el.id === '__privsight-floating-panel__' ||
-        el.closest('#__privacy-agent-overlay__, #__privsight-host__, #__privsight-floating-panel__')
+        el.id === '__antigravity_agent_border__' ||
+        el.closest('#__privacy-agent-overlay__, #__privsight-host__, #__privsight-floating-panel__, #__antigravity_agent_border__')
       ) {
         continue;
       }
@@ -221,6 +223,30 @@ export function isElementOccluded(el: Element, rect?: DOMRect | BoundingBox): bo
     return false;
   }
 
+  // CRITICAL EXEMPTION: Essential workflow action targets (verify & download, OTP fields, aadhaar radios)
+  // must NEVER be falsely marked as occluded by modals or backdrops.
+  const elText = ((el as HTMLElement).textContent || '').toLowerCase();
+  const elAria = (el.getAttribute('aria-label') || '').toLowerCase();
+  const elRole = (el.getAttribute('role') || '').toLowerCase();
+  const elVal = ((el as HTMLInputElement).value || '').toLowerCase();
+  const elType = (el as HTMLInputElement).type?.toLowerCase() || '';
+
+  const isEssentialAction =
+    /verify|download|otp|submit/i.test(elText) ||
+    /verify|download|otp|submit/i.test(elAria) ||
+    /verify|download|otp|submit/i.test(elRole) ||
+    /masked|regular/i.test(elVal) ||
+    /masked|regular/i.test(elText) ||
+    (el.tagName === 'INPUT' && (elType === 'radio' || (el as HTMLInputElement).maxLength === 1));
+
+  if (isEssentialAction) {
+    const vpLeft = (r as any).left !== undefined ? (r as any).left : (r as any).x - window.scrollX;
+    const vpTop = (r as any).top !== undefined ? (r as any).top : (r as any).y - window.scrollY;
+    if (vpTop >= -50 && vpTop <= window.innerHeight + 100 && vpLeft >= -50 && vpLeft <= window.innerWidth + 100) {
+      return false;
+    }
+  }
+
   // 3. Active modal containment check:
   // If active modals exist, elements outside all active modals are occluded by the modal/backdrop
   const activeModals = getActiveModals();
@@ -275,12 +301,13 @@ export function isElementOccluded(el: Element, rect?: DOMRect | BoundingBox): bo
       const probe = document.elementFromPoint(pt.x, pt.y);
       if (!probe) continue;
 
-      // Ignore our own visual overlay / floating panel
+      // Ignore our own visual overlay / floating panel / agent border
       if (
         probe.id === '__privacy-agent-overlay__' ||
         probe.id === '__privsight-host__' ||
         probe.id === '__privsight-floating-panel__' ||
-        probe.closest('#__privacy-agent-overlay__, #__privsight-host__, #__privsight-floating-panel__')
+        probe.id === '__antigravity_agent_border__' ||
+        probe.closest('#__privacy-agent-overlay__, #__privsight-host__, #__privsight-floating-panel__, #__antigravity_agent_border__')
       ) {
         anyVisible = true;
         break;

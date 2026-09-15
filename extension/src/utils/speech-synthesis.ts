@@ -28,6 +28,7 @@ export interface VoiceOutputOptions {
 const EMAIL_REGEX = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/i;
 const PHONE_REGEX = /\b(?:\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}\b/;
 const CREDIT_CARD_REGEX = /\b(?:\d{4}[-\s]?){3}\d{4}\b/;
+const AADHAAR_REGEX = /\b[2-9]\d{3}[\s-]?[0-9]{4}[\s-]?[0-9]{4}\b/;
 const TOKEN_KEY_REGEX = /\b(?:bearer\s+[a-zA-Z0-9_\-\.]+|ghp_[a-zA-Z0-9]+|sk-[a-zA-Z0-9]{20,}|eyJ[a-zA-Z0-9_\-]{10,}\.[a-zA-Z0-9_\-]{10,})\b/i;
 const REDACTED_PLACEHOLDER_REGEX = /\[.*(?:REDACTED|BLURRED|MASKED).*\].*/i;
 
@@ -40,6 +41,7 @@ export function containsSensitiveData(text: string): boolean {
     EMAIL_REGEX.test(text) ||
     PHONE_REGEX.test(text) ||
     CREDIT_CARD_REGEX.test(text) ||
+    AADHAAR_REGEX.test(text) ||
     TOKEN_KEY_REGEX.test(text) ||
     REDACTED_PLACEHOLDER_REGEX.test(text)
   );
@@ -47,7 +49,7 @@ export function containsSensitiveData(text: string): boolean {
 
 /**
  * Sanitizes search / input queries for spoken output:
- * - Strips any detected PII (emails, phones, cards, tokens, CVVs)
+ * - Strips any detected PII (emails, phones, cards, Aadhaar, tokens, CVVs)
  * - Limits length to ~100 characters to avoid excessive speech
  * - Replaces URLs with clean domains
  */
@@ -57,6 +59,10 @@ export function sanitizeTextForSpeech(text: string, maxLength: number = 100): st
 
   // Strip CVV / security codes
   clean = clean.replace(/\b(?:cvv|cvc|csc|security\s*code)\s*[:=]?\s*\d{3,4}\b/gi, 'security code');
+  // If text contains an Aadhaar number, mask it
+  clean = clean.replace(/\b[2-9]\d{3}[\s-]?[0-9]{4}[\s-]?[0-9]{4}\b/g, 'Aadhaar number');
+  // If text contains an OTP, mask it
+  clean = clean.replace(/\b(?:otp|passcode|code|pin)\s*[:=]?\s*\d{4,8}\b/gi, 'one-time code');
   // If text contains an email, mask it
   clean = clean.replace(EMAIL_REGEX, 'email address');
   // If text contains a phone number, mask it
@@ -139,6 +145,15 @@ export function getSafeSpokenActionMessage(
     case 'fill': {
       const targetName = (targetFriendlyName || action.target?.friendlyName || action.target?.label || '').toLowerCase();
       const rawVal = action.value || '';
+
+      // Check Aadhaar / Government ID fields
+      if (targetName.includes('aadhaar') || targetName.includes('aadhar') || targetName.includes('uid') || AADHAAR_REGEX.test(rawVal)) {
+        return 'Entering the Aadhaar number.';
+      }
+      // Check OTP / verification code fields
+      if (targetName.includes('otp') || targetName.includes('passcode') || targetName.includes('verification code')) {
+        return 'Entering the one-time password.';
+      }
 
       // Check card / financial fields first
       if (targetName.includes('card') || targetName.includes('credit') || targetName.includes('debit') || targetName.includes('cc')) {
